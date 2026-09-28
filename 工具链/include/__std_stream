@@ -1,0 +1,25 @@
+// fmt 的 ostream.h 在「Windows + libc++」这一支上要引 <__std_stream>，那是 libc++ 用来把 std::cout
+// 接到 Windows 控制台的缓冲区。Zig 的 libc++ 不带它。
+//
+// fmt 对它的用法只有一处：拿到流底下的 FILE*，好在 Windows 控制台上写 UTF-16。而那个函数本来就是
+// 四选一 —— MSVC / libstdc++ / libc++ / **什么都不做**。这里给的就是让第四支成立：类存在、
+// __file_ 成员在，fmt 的模板参数能解析；但这个构建里没有任何东西会构造它，所以
+// write_ostream_unicode 里的 dynamic_cast 永远失败，行为**正好等于它自己的那个 fallback**。
+//
+// 丢的只是「往 Windows 控制台写中文」这点方便，不是正确性 —— 字节照样按原样写出去。
+#pragma once
+
+#include <cstdio>
+#include <streambuf>
+#include <string>
+
+namespace std {
+
+template <class CharT, class Traits = char_traits<CharT>>
+class __stdoutbuf : public basic_streambuf<CharT, Traits> {
+public:
+    // fmt 取这个成员的指针当模板实参，用它够到流背后的 FILE*。
+    FILE* __file_ = nullptr;
+};
+
+}  // namespace std

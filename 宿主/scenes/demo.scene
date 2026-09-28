@@ -1,0 +1,56 @@
+# 烛龙 demo scene -- the same scene 宿主/render_scene builds in code, so the two
+# renders can be compared. This file is the point of Scene being data: extend the
+# scene here and nothing needs recompiling.
+#
+# Directives, one per line, '#' begins a comment:
+#   camera eye|target|up X Y Z
+#   camera fov|near|far F
+#   background R G B [A]
+#   ambient R G B
+#   shadow SIZE                                          (0 = no shadows)
+#   light DIRECTION_X DIRECTION_Y DIRECTION_Z  R G B     (one line per light)
+#   mesh box | mesh grid N
+#   texture checker SIZE CELLS | texture normal SIZE CELLS
+#   material R G B A [specular F] [texture INDEX] [normal INDEX] [none]
+#   node MESH MATERIAL PARENT X Y Z ROTY_DEGREES SCALE    (PARENT -1 = a root)
+
+camera eye 0 2.8 6.2
+camera target 0 0.6 0
+
+background 0.05 0.06 0.10
+
+# a warm key and a dim cool fill from the other side
+ambient 0.18 0.19 0.24
+shadow 512
+light 0.45 0.80 0.40  0.85 0.82 0.75
+light -0.50 0.25 -0.60  0.18 0.22 0.35
+
+mesh grid 1
+mesh box
+texture checker 64 8
+texture normal 64 4
+
+# the ground is textured, normal-mapped and matte; the boxes are tinted and glossy
+material 1 1 1 1 specular 0.05 texture 0 normal 1
+material 0.85 0.35 0.30 1 specular 0.45 none
+material 0.30 0.70 0.40 1 specular 0.45 none
+material 0.35 0.50 0.90 1 specular 0.45 none
+
+# ground
+node 0 0 -1 0 0 0 0 24
+# the tower, and a box stacked on it (parent 1)
+node 1 1 -1 -2 0.7 0.3 30 1.4
+node 1 2 1 0 1 0 0 0.6
+# a loose box, and one behind the camera that the cull drops
+node 1 3 -1 2.3 0.45 0.6 120 0.9
+node 1 3 -1 0 0.5 20 0 1.5
+# --- audio -------------------------------------------------------------------
+#
+# The listener is the camera above -- literally the same camera, because one file
+# describes one world. A bed sits on the listener so it stays centred, and a chime
+# hangs off the tower's own node: its parent is node 1, so it is heard from wherever
+# that tower is, without this file repeating the tower's transform.
+sound tone 220 0.5
+sound tone 880 0.25
+emitter 0 -1 0 2.8 6.2 gain 0.3 loop
+emitter 1 1 0 1.2 0 gain 0.8 max 12 loop

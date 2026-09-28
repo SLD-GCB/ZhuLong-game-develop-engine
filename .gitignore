@@ -1,23 +1,43 @@
-### AL ###
-#Template for AL projects for Dynamics 365 Business Central
-#launch.json folder
-.vscode/
-#Cache folder
-.alcache/
-#Symbols folder
-.alpackages/
-#Snapshots folder
-.snapshots/
-#Testing Output folder
-.output/
-#Extension App-file
-*.app
-#Rapid Application Development File
-rad.json
-#Translation Base-file
-*.g.xlf
-#License-files
-*.bclicense
-*.flf
-#Test results file
-TestResults.xml
+# 开源之前先看清这一份 —— 下面的每一条都写了**为什么**，不是抄来的模板。
+
+# --- 对话记录：**绝对不能公开** ------------------------------------------------------------
+#
+# 那是开发过程的对话记录。它记着谁在什么时候为什么做了什么、走过哪些错路 —— 对这些留在本地是
+# 资产，公开出去是别的问题。**这一条不要改。**
+上下文记录/
+
+# --- 构建产物：本地的，几百 MB，而且带着这台机器的绝对路径 --------------------------------
+build/                  # MSVC 构建树。`打包.py` 要从它读 Vulkan 的路径和库名，所以本地要有
+build-zig/              # Zig 构建树，`打包.py` 编出来的
+build-打包/             # `打包.py` 的中间产物
+build-后端/             # DLL 那一步的中间产物
+发行/                   # 出包的结果。几百 MB，而且每次打包都是新的
+
+# --- 本地那份运行环境：321 MB，而且是**装出来的**，不是源码 ----------------------------------
+#
+# 里面是一份 Zig 编译器（MIT，自己下：https://ziglang.org）和一份 Python 运行环境。
+# 都不该进仓库：它们能从别处拿到，而且几百 MB。
+运行环境/
+
+# --- Python ---------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- 编辑器 / 系统 ---------------------------------------------------------------------------
+.vscode/settings.json   # 各人的路径不一样；`launch.json` 那种共用的配置留着
+.idea/
+*.suo
+*.user
+Thumbs.db
+desktop.ini
+
+# --- 出包/压缩的产物 -------------------------------------------------------------------------
+*.zip
+*.7z
+
+# --- 这个项目自己没有的东西，但很容易被误带进来 ----------------------------------------------
+#
+# `编码器/icon.ico` **不在这里** —— 它是 `烛龙.jpg` 生出来的，但也留在树里：从源码跑编辑器的时候
+# 要用它，而生成它要装 Pillow。172 KB，留着比"少一个依赖"划算。
