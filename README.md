@@ -9,6 +9,9 @@
 <p align="center"><i>同一套代码，两个身份。</i></p>
 
 ---
+游戏开发示例仓库：
+https://github.com/SLD-GCB/ZhuLong-game
+
 
 ## 这是什么
 
