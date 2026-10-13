@@ -4,9 +4,13 @@
 
 <h1 align="center">烛龙 ZhuLong</h1>
 
-<p align="center"><i>一台 Switch 模拟器，同时它的 GPU 层和引擎层本身就是一个游戏开发工具。</i></p>
+<p align="center"><i>一套自研的 C++ 引擎：向下模拟一台机器（内核），向上是一套游戏开发工具（引擎）。</i></p>
 
 <p align="center"><i>同一套代码，两个身份。</i></p>
+
+<p align="center">
+  <img src="docs/screen-editor.png" width="780" alt="烛龙引擎 · 编码器与实时画面">
+</p>
 
 ---
 游戏开发示例仓库：
