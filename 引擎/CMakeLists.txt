@@ -10,7 +10,11 @@ add_library(zlong_engine STATIC
     src/obj_file.cpp
     src/renderer.cpp
     src/scene_file.cpp
+    src/song.cpp
+    src/song_file.cpp
     src/sound.cpp
+    src/synth.cpp
+    src/wav_file.cpp
 )
 add_library(zlong::engine ALIAS zlong_engine)
 

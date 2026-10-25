@@ -28,6 +28,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -327,13 +328,17 @@ public:
         return taken;
     }
 
-    /// 一次"存 / 读 / 导入"的吩咐。
+    /// 一次"存 / 读 / 导入 / 贴图 / 插图片 / 导出场景"的吩咐。
     struct FileOrder {
         enum class Kind {
-            Save,      // 把手上这份存到那儿
-            Load,      // 从那儿读一份自己的模型
-            Import,    // 从那儿读一份别人的网格文件
-            Texture,   // 给选中的面上那儿的一张图
+            Save,      // 把活动对象存到那儿
+            Load,      // 从那儿读一份自己的模型（新对象）
+            Import,    // 从那儿读一份别人的网格文件（新对象）
+            Texture,   // 给选中的面挂那儿的一张图
+            Picture,   // 往场景里放一张图（一块贴着它的平面对象）
+            Scene,     // 把整个场景导出到那儿的 .scene
+            Song,      // 从那儿读一份 .song（一首曲子）
+            SongSave,  // 把活动那首曲子写成那儿的 .song
         };
         Kind kind = Kind::Load;
         std::string path;
@@ -350,6 +355,46 @@ public:
         taken.swap(files_);
         return taken;
     }
+
+    /// 一次"放一个图元"。`kind` 是个号，不是路径：1 方块、2 网格、3 圆盘、4 圆柱、5 圆锥、6 球。
+    ///
+    /// **它是值那一类，不是键那一类。** 和"上色""贴图"一样 —— 形状是个**值**，敲一下键带不走它；
+    /// 面板上那些纯操作按钮（挤出、细分…）才走 `K`。
+    struct Placement {
+        int kind = 0;
+    };
+
+    /// 编辑器点下来的图元，最早的在前。
+    std::vector<Placement> TakePlacements() {
+        std::vector<Placement> taken;
+        taken.swap(placements_);
+        return taken;
+    }
+
+    /// 大纲视图点了一下：把第 `index` 个对象选成活动对象（最早的在前）。
+    std::vector<int> TakeSelections() {
+        std::vector<int> taken;
+        taken.swap(selections_);
+        return taken;
+    }
+
+    /// 一次"把某个参数设成这个值"。**是值那一类，不是键那一类** —— 和上色、图元同一种：一个音量
+    /// 是个值，敲一下键带不走它。`name` 是一个词，后面跟一到几个数。
+    struct Value {
+        std::string name;
+        std::vector<float> numbers;
+    };
+
+    /// 编辑器交下来的参数值，最早的在前。
+    std::vector<Value> TakeValues() {
+        std::vector<Value> taken;
+        taken.swap(values_);
+        return taken;
+    }
+
+    /// 编辑器要不要每帧报一次播放位置（`R` 那一行）。它是**状态**不是事件：开始报就一直报，
+    /// 直到说停。见 `宿主/audio` 那个播放头。
+    bool report_play() const { return report_play_; }
 
 private:
     static void put(unsigned char* at, std::uint32_t value) {
@@ -379,10 +424,23 @@ private:
     ///     L <路径>                                从这个路径读自己的模型
     ///     I <路径>                                从这个路径导入别人的网格文件
     ///     T <路径>                                给选中的面挂上这个路径的一张图
+    ///     J <路径>                                往场景里放一张图（一块贴着它的平面对象）
+    ///     E <路径>                                把整个场景导出到这个 .scene
+    ///     U <路径>                                从这个路径读一份 .song（一首曲子）
+    ///     B <路径>                                把活动那首曲子写成一份 .song
+    ///     R <0|1>                                 开始 / 停止每帧报一次播放位置（回一行 `play`）
+    ///     P <图元号>                               手里拿上一个图元（1 方块 … 9 圆台），下一次左键放在画面上
+    ///     N <对象号>                               把第几个对象选成活动对象（大纲视图点了一下）
+    ///     V <名字> <数…>                           把某个参数设成这个值（音频工具：gain / reference /
+    ///                                              max / master / loop / freq / length …）
     ///
-    /// 最后四条（带路径的那些）是**行里剩下的全部**，不做分词 —— 路径里有空格，而且它是 UTF-8，
-    /// 按空白切会把一条路径切成两半。`K` 那一行的修饰键是**后加的**，老的一行只有两个数，缺了
-    /// 就是 0。
+    /// **`P` 和 `I` 这一对是"一个字母、两套号"**：建模器把 `P` 当图元号（1 方块 … 9 圆台）、把 `I`
+    /// 当 OBJ 导入；音频工具把 `P` 当声源种类（1 音调 2 噪声）、把 `I` 当 WAV 导入。两个工具从不同
+    /// 时跑，面板发的是"给正在跑的那个程序"的话，所以一个字母够用 —— 而每个工具只认自己那一套号，
+    /// 认不出来的行丢掉（见下）。
+    ///
+    /// 带路径的那四条是**行里剩下的全部**，不做分词 —— 路径里有空格，而且它是 UTF-8，按空白切会把一条
+    /// 路径切成两半。`K` 那一行的修饰键是**后加的**，老的一行只有两个数，缺了就是 0。
     ///
     /// 另一头是 `编码器/main.py` 的 `_on_view_*`，改这里就要改那里 —— 这两处是一套协议。
     /// 认不出来的行**丢掉**，不是报错：管子是共享的，将来多一种消息不该让旧的一端炸掉。
@@ -444,17 +502,64 @@ private:
         case 'S':
         case 'L':
         case 'I':
-        case 'T': {
+        case 'T':
+        case 'J':
+        case 'E':
+        case 'U':
+        case 'B': {
             std::size_t at = 1;
             while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) {
                 ++at;
             }
             if (at < line.size()) {
-                const auto kind = line[0] == 'S'   ? FileOrder::Kind::Save
-                                  : line[0] == 'L' ? FileOrder::Kind::Load
-                                  : line[0] == 'I' ? FileOrder::Kind::Import
-                                                   : FileOrder::Kind::Texture;
+                FileOrder::Kind kind = FileOrder::Kind::Load;
+                switch (line[0]) {
+                case 'S': kind = FileOrder::Kind::Save; break;
+                case 'L': kind = FileOrder::Kind::Load; break;
+                case 'I': kind = FileOrder::Kind::Import; break;
+                case 'T': kind = FileOrder::Kind::Texture; break;
+                case 'J': kind = FileOrder::Kind::Picture; break;
+                case 'E': kind = FileOrder::Kind::Scene; break;
+                case 'U': kind = FileOrder::Kind::Song; break;
+                case 'B': kind = FileOrder::Kind::SongSave; break;
+                }
                 files_.push_back(FileOrder{kind, line.substr(at)});
+            }
+            break;
+        }
+        case 'P': {
+            int kind = 0;
+            if (std::sscanf(line.c_str() + 1, "%d", &kind) == 1 && kind > 0) {
+                placements_.push_back(Placement{kind});
+            }
+            break;
+        }
+        case 'N': {
+            int index = 0;
+            if (std::sscanf(line.c_str() + 1, "%d", &index) == 1 && index >= 0) {
+                selections_.push_back(index);
+            }
+            break;
+        }
+        case 'V': {
+            // 名字一个词，后面跟着所有的数。数不定几个（`loop 1` 是一个，`freq 440 length 0.5`
+            // 也说得通），所以是一路读到没有为止，不数个数。
+            std::istringstream stream(line.substr(1));
+            Value value;
+            if (stream >> value.name) {
+                float number = 0.0f;
+                while (stream >> number) {
+                    value.numbers.push_back(number);
+                }
+                values_.push_back(value);
+            }
+            break;
+        }
+        case 'R': {
+            // 编辑器要不要"每一帧报一次播放位置"。它是开关，不是值 —— 所以不走 `V`。
+            int value = 0;
+            if (std::sscanf(line.c_str() + 1, "%d", &value) == 1) {
+                report_play_ = value != 0;
             }
             break;
         }
@@ -475,6 +580,10 @@ private:
     int wheel_ = 0;
     std::vector<FileOrder> files_;
     std::vector<Colour> colours_;
+    std::vector<Placement> placements_;
+    std::vector<int> selections_;
+    std::vector<Value> values_;
+    bool report_play_ = false;
 };
 
 }  // namespace zlong::editor

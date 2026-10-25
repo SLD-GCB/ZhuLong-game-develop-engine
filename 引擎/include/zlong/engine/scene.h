@@ -210,6 +210,14 @@ struct Emitter {
     float max_distance = 20.0f;
     /// Whether the sound restarts when it ends.
     bool loop = false;
+    /// Whether the listener's **place and facing** shape this emitter.
+    ///
+    /// A sound **in** the world (a footstep on the stone, a chime across the yard) is spatial: its
+    /// gain falls off with distance and it pans with the direction it is heard from. **Background
+    /// music is not** — it should be the same wherever the listener stands, so it is full gain and
+    /// dead centre. That is the whole difference, and it is why a song normally plays from a
+    /// non-spatial emitter.
+    bool spatial = true;
 };
 
 struct Scene {

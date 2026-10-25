@@ -230,11 +230,19 @@ def program_command(program: Path, arguments: list[str], working_directory: Path
                    frames=True)
 
 
+# 建模器把**对象表**发回来的那些行带这个前缀（走 stdout，和文字同一条管子）。打头是一个控制字符
+# `\x01`，正常输出几乎不可能撞上。格式在 `宿主/modeler/main.cpp` 的 `PublishScene` 和 `main.py` 的
+# `_on_model_scene` —— 两边是一套协议。行长这样：`... begin` / `... obj <号> <名字>` / `... sel <号>`
+# / `... end`。
+SCENE_PREFIX = "\x01" "zl "
+
+
 class Runner(QObject):
     """Runs one child at a time and reports what it says, and what it shows."""
 
     output = Signal(str)                    # a line of the child's output
     frame = Signal(bytes, int, int, int)    # rgba, pitch, width, height
+    scene = Signal(str)                     # a structural line (object list) from the child
     finished = Signal(int, float)           # exit code, seconds
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -328,7 +336,13 @@ class Runner(QObject):
         self._buffer += chunk
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            self.output.emit(line.rstrip("\r"))
+            line = line.rstrip("\r")
+            # 带哨兵前缀的行是**结构**（对象表），不是给人看的文字 —— 分到另一条信号去，
+            # 不让它落进控制台。哨兵是 `\x01zl `（一个控制字符打头，正常输出几乎不可能撞上）。
+            if line.startswith(SCENE_PREFIX):
+                self.scene.emit(line)
+            else:
+                self.output.emit(line)
 
     def _flush(self) -> None:
         if self._buffer:

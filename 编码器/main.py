@@ -24,12 +24,17 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFileSystemModel,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QColorDialog,
@@ -48,8 +53,10 @@ import templates
 from console import Console
 from editor import CodeEditor
 from findbar import FindBar
-from runtime import Command, Runner, editor_asset, find_backend, program_command, project_root, \
-    python_command, split_arguments
+from instruments import InstrumentDialog
+from runtime import SCENE_PREFIX, Command, Runner, editor_asset, find_backend, program_command, \
+    project_root, python_command, split_arguments
+from timeline import TimelineView
 from viewport import Viewport
 from window import Mirror
 
@@ -76,9 +83,10 @@ _CHOICES = (
 _BUILDING = "编译中…"
 _RUNNING = "运行中…"
 
-# 哪两页，按 `QStackedWidget` 的下标排。
+# 哪几页，按 `QStackedWidget` 的下标排。三页了：代码、3D 建模、音频。
 _PAGE_CODE = 0
 _PAGE_MODEL = 1
+_PAGE_AUDIO = 2
 
 # 建模器在哪儿找，按顺序。**这是两个不同的地方**：
 #
@@ -91,6 +99,13 @@ _MODELER_PATHS = (
     ("build-zig", "宿主", "zlong_modeler.exe"),
 )
 
+# 音频器在哪儿找，按同样的顺序和同样的道理。CMake 目标叫 `zlong_audiotool`（不是 `zlong_audio`
+# —— 那个名字已经是内核那层音频库了）。
+_AUDIO_PATHS = (
+    ("音频器", "音频器.exe"),
+    ("build-zig", "宿主", "zlong_audiotool.exe"),
+)
+
 # 建模页上那几个按钮：**它们不自己实现任何东西，只替用户敲一下这个键**。
 #
 # 键码是 Windows 的虚拟键码，`'1'` `'2'` `'Z'` 各自就是自己的 ASCII。所以这一页和"在编辑器里
@@ -98,20 +113,97 @@ _MODELER_PATHS = (
 _MODEL_BUTTONS = (
     ("选面", 49, "选一个面（键 1）"),
     ("选点", 50, "选一个顶点（键 2）"),
+    ("选对象", 51, "选中一整个图形/对象（键 3）：点一下就选中它，按住左键整块拖"),
     ("挤出", 69, "把选中的面沿它的法线挤出一层（键 E）"),
     ("细分", 68, "Catmull-Clark 细分一次，整个模型（键 D）"),
     ("切角", 66, "把选中的角切掉（键 B）：点模式切那个点，面模式切那个面的四个角"),
     ("硬边", 67, "把选中那个面的一圈边标成硬边 / 取消（键 C），细分时它们不跟着变圆"),
-    ("删面", 88, "删掉选中的面，在那儿留一个洞（键 X）；没人指着的点会跟着丢掉"),
+    ("删除", 88, "删掉选中的东西（键 X）：对象模式删整个对象，面模式删那个面（在那儿留一个洞）"),
+    ("旋转", 82, "旋转选中的对象（键 R）：点它之后**左右移鼠标绕 Y 转、上下移绕 X 转**，左键定下来，Esc 取消"),
+    ("缩放", 84, "缩放选中的对象（键 T）：点它之后**左右移鼠标**改大小，左键定下来，Esc 取消"),
+    ("复制", 86, "复制当前对象（键 V）：新的一份沿画面往右错开一点，直接就是选中的"),
+    ("合并", 74, "把选中的多个对象合并成一个（键 J）：先在对象模式下 Shift 点加选，再点这里"),
+    ("落下", 70, "把选中的对象落下去（键 F）：落到地面上，或者叠到它正下方那个对象的顶上"),
+    ("焊接", 87, "把贴在一起的两块焊成一张连续的面（键 W）：先选中它们，再点这里"),
+    ("并集", 85, "布尔并集（键 U）：选中两块，合成一块（去掉里面重叠的部分）"),
+    ("交集", 73, "布尔交集（键 I）：只留两块重叠的部分"),
+    ("差集", 75, "布尔差集（键 K）：从主对象里挖掉另一个（主 = 最后点的那一个）"),
     ("撤销", 90, "撤销上一步（键 Z）"),
+    ("坐标轴", 89, "三条坐标轴开 / 关（键 Y）—— 默认不显示"),
 )
 
-# 建模器那块画面出多少像素。**形状跟着面板走，份量保持在这儿** —— 见 `_model_render_size`。
+# 图元那一排按钮：**它们发的是一个号，不是一次按键。** 形状是个"值" —— 和「上色」「贴图」一样，
+# 敲一下键带不走它。所以走的是 `P <图元号>`，程序那头收到就把这个形状拿在手里，下一次左键放在画面上。
+#
+# 号是两边约好的（`宿主/modeler/main.cpp` 的 `Primitive` 枚举，`宿主/editor_host.h` 的 `P` 说明）。
+# 它们是**一次性**的：放一个就回到选择；要再放一个，再点一下这里。
+_MODEL_PRIMITIVES = (
+    ("方块", 1, "放一个立方体（单位大小）"),
+    ("网格", 2, "放一块平面网格"),
+    ("圆盘", 3, "放一个圆盘"),
+    ("圆柱", 4, "放一个圆柱"),
+    ("圆锥", 5, "放一个圆锥"),
+    ("球", 6, "放一个球"),
+    ("圆环", 7, "放一个圆环"),
+    ("金字塔", 8, "放一个金字塔（方底 + 尖）"),
+    ("圆台", 9, "放一个圆台（截了顶的圆锥）"),
+)
+
+# 工具那块画面出多少像素。**形状跟着面板走，份量保持在这儿** —— 见 `_render_size`（建模器和
+# 音频器共用这一份）。
 #
 # 800×500 就是建模器自己的默认值，也是量着帧率挑出来的那一档（`宿主/modeler` 开头那张表：800×500
 # 是 54 帧，1024×640 掉到 34 帧）。所以这里只换形状、不涨份量：图铺满面板，帧率一动不动。
 # 想要更清楚，把这个数乘个系数就行，代价写在那一张表里。
 _MODEL_PIXELS = 800 * 500
+
+# 音频页上那几个按钮：**它们不自己实现任何东西，只替用户敲一下这个键**。和建模页同一套 —— 键码
+# 是 Windows 的虚拟键码，空格 `' '` 是 32、`L` 76、`M` 77、`X` 88、`Z` 90、上下箭头 38 / 40。
+_AUDIO_BUTTONS = (
+    ("播放/暂停", 32, "空格：开始 / 停下来（声音是每帧现混进声卡的）"),
+    ("循环", 76, "把选中声源的循环开关翻一下（键 L）"),
+    ("静音", 77, "把选中声源静音 / 取消静音（键 M）"),
+    ("删除", 88, "删掉选中的声源（键 X）"),
+    ("上一个", 38, "选中上一个声源（↑）"),
+    ("下一个", 40, "选中下一个声源（↓）"),
+    ("撤销", 90, "撤销上一步（键 Z）"),
+)
+
+# 声源种类那一排：**发的是一个号，不是一次按键** —— `P <号>`，和建模器那排图元一个走法。号是两边
+# 约好的（`宿主/audio/main.cpp` 的 `Armed`、`宿主/editor_host.h` 的 `P` 说明）。一次性：放一个就
+# 回到选择；要再放一个，再点一下这里。
+_AUDIO_SOUNDS = (
+    ("音调", 1, "手里拿上一段音调（440 Hz 半秒），再在画面上左键点一下就放在那里"),
+    ("噪声", 2, "手里拿上一段噪声（半秒），再在画面上左键点一下就放在那里"),
+    ("音效", 3, "手里拿上一段合成音效（默认一声下滑的激光），再在画面上左键点一下就放在那里"),
+)
+
+# 那个「音效…」对话框里每一栏的（初值、范围、步长、小数位）。**顺序就是发给程序的顺序** ——
+# 对话框回填 `_audio_synth` 也是这个顺序（波形单独在最前）。
+_AUDIO_SYNTH_FIELDS = (
+    ("f0", "起始频率 Hz", 1200.0, 1.0, 20000.0, 10.0, 1),
+    ("f1", "结束频率 Hz", 300.0, 1.0, 20000.0, 10.0, 1),
+    ("seconds", "长度 秒", 0.22, 0.02, 30.0, 0.01, 3),
+    ("attack", "起音 秒", 0.004, 0.0, 10.0, 0.005, 3),
+    ("decay", "衰减 秒", 0.06, 0.0, 10.0, 0.005, 3),
+    ("sustain", "持续电平 0..1", 0.25, 0.0, 1.0, 0.05, 2),
+    ("release", "释音 秒", 0.12, 0.0, 10.0, 0.005, 3),
+    ("cutoff", "低通 Hz（0 = 关）", 0.0, 0.0, 20000.0, 100.0, 0),
+)
+
+# 参数那一排：**发的是 `V <名字> <数>`** —— 音量是个值，敲一下键带不走它。**带符号的是"加这个
+# 数"**（面板不知道当前值是多少，所以能加减的就说成加减）；不带符号的（频率、长度）走弹窗问一个
+# 绝对值，那两条在 `_audio_frequency` / `_audio_length` 里。
+_AUDIO_VALUES = (
+    ("响一点", ("gain", 0.1), "选中声源的音量 +0.1"),
+    ("轻一点", ("gain", -0.1), "选中声源的音量 -0.1"),
+    ("整场响", ("master", 0.1), "整场音量 +0.1"),
+    ("整场轻", ("master", -0.1), "整场音量 -0.1"),
+    ("参考距离+", ("reference", 0.5), "参考距离 +0.5（这个距离以内都是满音量）"),
+    ("参考距离-", ("reference", -0.5), "参考距离 -0.5"),
+    ("最远+", ("max", 2.0), "最大距离 +2（再远就听不见了）"),
+    ("最远-", ("max", -2.0), "最大距离 -2"),
+)
 
 # A window's palette, close enough to VS Code's dark theme that the gutter and the code agree.
 _STYLE = """
@@ -160,12 +252,15 @@ class EditorWindow(QMainWindow):
         self._after_build: tuple[Path, Path] | None = None
         # Set while packaging, so its exit can be told from the program's too.
         self._packing: packager.Plan | None = None
-        # 正在跑的是不是建模器 —— 决定画面画到哪块面板上。见 `_active_view`。
+        # 正在跑的是不是建模器 / 音频器 —— 决定画面画到哪块面板上、声源表落到哪个大纲里。
+        # 见 `_active_view` 和 `_on_scene`。
         self._model_running = False
+        self._audio_running = False
 
         self._runner = Runner(self)
         self._runner.output.connect(self._on_output)
         self._runner.frame.connect(self._on_frame)
+        self._runner.scene.connect(self._on_scene)
         self._runner.finished.connect(self._on_finished)
 
         # A compiled program presents where it was written to present, so the editor watches for its
@@ -201,12 +296,13 @@ class EditorWindow(QMainWindow):
                                     QKeySequence.StandardKey.Close)
         self.act_quit = action("退出", self.close, QKeySequence.StandardKey.Quit)
 
-        # 两页，互斥 —— **这就是"进入 3D 建模"的入口**。放在工具栏最左边，见 `_build_menus`。
+        # 三页，互斥 —— **这就是"进入 3D 建模 / 音频"的入口**。放在工具栏最左边，见 `_build_menus`。
         self.act_page_code = action("代码", lambda: self._show_page(_PAGE_CODE))
         self.act_page_model = action("3D 建模", lambda: self._show_page(_PAGE_MODEL))
+        self.act_page_audio = action("音频", lambda: self._show_page(_PAGE_AUDIO))
         self._page_group = QActionGroup(self)
         self._page_group.setExclusive(True)
-        for made in (self.act_page_code, self.act_page_model):
+        for made in (self.act_page_code, self.act_page_model, self.act_page_audio):
             made.setCheckable(True)
             self._page_group.addAction(made)
         self.act_page_code.setChecked(True)
@@ -250,7 +346,7 @@ class EditorWindow(QMainWindow):
                    self._new_file(name="untitled" + suffix, text=source))
             for name, source, suffix in (
                 (*templates.EMPTY, ".py"), (*templates.SCENE, ".py"), (*templates.HOST, ".py"),
-                (*templates.CPP, ".cpp"))
+                (*templates.CPP, ".cpp"), (*templates.SONG, ".song"))
         ]
 
     def _build_layout(self) -> None:
@@ -332,11 +428,12 @@ class EditorWindow(QMainWindow):
         bottom_layout.addLayout(header)
         bottom_layout.addWidget(self._console)
 
-        # 两页共用底下那个控制台：**输出在哪一页都看得见**。建模器说的话（"面 1 / 共 6 个"、
-        # "移动完成…"）就落在那里，边建模边看着它。
+        # 三页共用底下那个控制台：**输出在哪一页都看得见**。建模器说的话（"面 1 / 共 6 个"、
+        # "移动完成…"）和音频器说的话（"放下：音调 1，在 …"）都落在那里，边做边看着它。
         self._pages = QStackedWidget()
         self._pages.addWidget(top)                       # 0：代码
         self._pages.addWidget(self._build_model_page())  # 1：3D 建模
+        self._pages.addWidget(self._build_audio_page())  # 2：音频
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self._pages)
@@ -375,7 +472,7 @@ class EditorWindow(QMainWindow):
             strip.addWidget(button)
         strip.addStretch(1)
         self._model_colour = QPushButton("上色")
-        self._model_colour.setToolTip("给选中的面挑一个颜色（先按 1 切到选面、点一个面）")
+        self._model_colour.setToolTip("给选中的东西挑一个颜色：对象模式涂整个对象，面模式涂那个面")
         self._model_colour.clicked.connect(self._colour_model)
         self._model_tools.append(self._model_colour)
         strip.addWidget(self._model_colour)
@@ -384,6 +481,11 @@ class EditorWindow(QMainWindow):
         self._model_texture.clicked.connect(self._texture_model)
         self._model_tools.append(self._model_texture)
         strip.addWidget(self._model_texture)
+        self._model_picture = QPushButton("插入图片")
+        self._model_picture.setToolTip("往场景里放一张图片：一块贴着它的平面对象（放在画面中央）")
+        self._model_picture.clicked.connect(self._insert_picture)
+        self._model_tools.append(self._model_picture)
+        strip.addWidget(self._model_picture)
         self._model_open = QPushButton("打开…")
         self._model_open.setToolTip("读一个 .model 进来")
         self._model_open.clicked.connect(self._open_model)
@@ -399,24 +501,60 @@ class EditorWindow(QMainWindow):
         self._model_save.clicked.connect(self._save_model)
         self._model_tools.append(self._model_save)
         strip.addWidget(self._model_save)
+        self._model_export = QPushButton("导出场景")
+        self._model_export.setToolTip("把整个场景导出一个 .scene（游戏直接读）：每个对象存成同级的 .model")
+        self._model_export.clicked.connect(self._export_scene)
+        self._model_tools.append(self._model_export)
+        strip.addWidget(self._model_export)
         self._model_start = QPushButton("开始建模")
         self._model_start.setToolTip("起一个建模器子进程：画面走这块面板，鼠标键盘也走它")
         self._model_start.clicked.connect(self._start_model)
         strip.addWidget(self._model_start)
         layout.addLayout(strip)
 
+        palette = QHBoxLayout()
+        palette.addWidget(QLabel("图元："))
+        for label, kind, tip in _MODEL_PRIMITIVES:
+            button = QPushButton(label)
+            button.setToolTip(f"{tip}：先点这里，再在画面上左键点一下")
+            button.clicked.connect(
+                lambda _checked=False, k=kind: self._on_model_primitive(k))
+            self._model_tools.append(button)
+            palette.addWidget(button)
+        palette.addStretch(1)
+        layout.addLayout(palette)
+
         self._model_view = Viewport()
+        self._model_view.set_fill(True)   # 建模画布要**铺满**，窗口变形状图也跟着铺满，不留黑边
         for signal, slot in ((self._model_view.key, self._on_view_key),
                              (self._model_view.moved, self._on_view_moved),
                              (self._model_view.clicked, self._on_view_clicked),
                              (self._model_view.wheeled, self._on_view_wheeled)):
             signal.connect(slot)
-        layout.addWidget(self._model_view, 1)
+        # 左边一列**对象**（大纲），右边是画面 —— 和 Blender 的 Outliner 一个位置。
+        self._model_scene: list[tuple[int, str]] = []
+        self._model_active = -1
+        self._model_syncing = False
+        self._model_objects = QListWidget()
+        self._model_objects.setToolTip("场景里的对象。点一个就选中它（视口里会亮），再切到面/点模式编它。")
+        self._model_objects.currentRowChanged.connect(self._on_model_row)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._model_objects)
+        split.addWidget(self._model_view)
+        split.setStretchFactor(1, 1)
+        split.setSizes([170, 630])
+        layout.addWidget(split, 1)
 
         hint = QHBoxLayout()
-        hint.addWidget(QLabel("右键转 · 中键平移 · 滚轮缩 · 左键选一个点或面，按住就拖着走"
-                              "（按着 Shift 吸附）　｜　键：1 面 · 2 点 · E 挤出 · D 细分 · "
-                              "B 切角 · C 硬边 · X 删面 · Z 撤销"))
+        hint_label = QLabel("转：左键拖空处 或 右键　·　平移：Shift+拖空处 或 中键　·　"
+                            "缩放：滚轮（选中对象时缩它）　·　选：左键点，**Shift 点 = 加选**　·　"
+                            "拖：点在东西上按住，拖动中按 X/Y/Z 锁轴　·　滚轮缩画面：Shift+滚轮　｜　"
+                            "图元：先点一个形状，再左键放到画面上（Esc 取消）　｜　"
+                            "键：1 面 · 2 点 · 3 对象 · R 转 · T 缩放 · V 复制 · J 合并 · F 落下 · "
+                            "W 焊接 · U 并集 · I 交集 · K 差集 · E 挤出 · D 细分 · B 切角 · "
+                            "C 硬边 · X 删除 · Y 坐标轴 · Z 撤销")
+        hint_label.setWordWrap(True)   # 不换行的话，这一长条的最小宽度会把整页撑得极宽、反挤画布
+        hint.addWidget(hint_label)
         hint.addStretch(1)
         self._model_frame_label = QLabel("")
         hint.addWidget(self._model_frame_label)
@@ -425,20 +563,236 @@ class EditorWindow(QMainWindow):
         self._model_tools_enabled(False)
         return page
 
+    # -- the audio page ----------------------------------------------------------------------
+
+    def _build_audio_page(self) -> QWidget:
+        """音频那一页：一块画面、左边一列声源、三排工具，一句提示。
+
+        和建模页是同一个走法：按钮**不实现任何东西**，只替用户敲一下键（`K`）或者发一个值（`V` /
+        `P`）。区别只在编排 —— 工具排成"键 / 声源 / 参数 / 文件"几排。
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        strip = QHBoxLayout()
+        self._audio_tools: list[QPushButton] = []
+        for label, key, tip in _AUDIO_BUTTONS:
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _checked=False, code=key: self._on_audio_key(code))
+            self._audio_tools.append(button)
+            strip.addWidget(button)
+        strip.addStretch(1)
+        self._audio_play = QPushButton("重开音频器")
+        self._audio_play.setToolTip("起一个音频器子进程：画面走这块面板，声音走声卡，鼠标键盘也走它")
+        self._audio_play.clicked.connect(self._start_audio)
+        strip.addWidget(self._audio_play)
+        layout.addLayout(strip)
+
+        # 一排声源种类：发的是 `P <号>`，和建模器那排图元一个走法。
+        sounds = QHBoxLayout()
+        sounds.addWidget(QLabel("声源："))
+        for label, kind, tip in _AUDIO_SOUNDS:
+            button = QPushButton(label)
+            button.setToolTip(f"{tip}：先点这里，再在画面上左键点一下")
+            button.clicked.connect(lambda _checked=False, k=kind: self._on_audio_sound(k))
+            self._audio_tools.append(button)
+            sounds.addWidget(button)
+        sounds.addStretch(1)
+        layout.addLayout(sounds)
+
+        # 一排参数：发的是 `V <名字> <数>`。
+        values = QHBoxLayout()
+        values.addWidget(QLabel("参数："))
+        for label, (name, amount), tip in _AUDIO_VALUES:
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _checked=False, n=name, a=amount: self._send_value(n, a))
+            self._audio_tools.append(button)
+            values.addWidget(button)
+        self._audio_freq = QPushButton("频率…")
+        self._audio_freq.setToolTip("把选中音调的频率设成一个数（Hz）")
+        self._audio_freq.clicked.connect(self._audio_frequency)
+        self._audio_tools.append(self._audio_freq)
+        values.addWidget(self._audio_freq)
+        self._audio_length = QPushButton("长度…")
+        self._audio_length.setToolTip("把选中声源的长度设成一个数（秒）")
+        self._audio_length.clicked.connect(self._audio_length_dialog)
+        self._audio_tools.append(self._audio_length)
+        values.addWidget(self._audio_length)
+        self._audio_synth_button = QPushButton("音效…")
+        self._audio_synth_button.setToolTip(
+            "把选中的**合成音效**调一遍：波形、起止频率、长度、包络（起音/衰减/持续/释音）、低通")
+        self._audio_synth_button.clicked.connect(self._audio_synth_dialog)
+        self._audio_tools.append(self._audio_synth_button)
+        values.addWidget(self._audio_synth_button)
+        self._audio_global = QPushButton("全局")
+        self._audio_global.setToolTip(
+            "让选中的声源**不跟位置走**（满音量、居中）—— 背景音乐就该这样；再按一下变回世界里的声源（键 G）")
+        self._audio_global.clicked.connect(lambda: self._send_value("global"))
+        self._audio_tools.append(self._audio_global)
+        values.addWidget(self._audio_global)
+        values.addStretch(1)
+        layout.addLayout(values)
+
+        files = QHBoxLayout()
+        files.addWidget(QLabel("文件："))
+        self._audio_open = QPushButton("打开…")
+        self._audio_open.setToolTip("读一个 .scene，把它声音那一半变成声源")
+        self._audio_open.clicked.connect(self._open_audio_scene)
+        self._audio_tools.append(self._audio_open)
+        files.addWidget(self._audio_open)
+        self._audio_import = QPushButton("导入 WAV…")
+        self._audio_import.setToolTip("读一个 WAV 放进世界（循环打开）")
+        self._audio_import.clicked.connect(self._import_wav)
+        self._audio_tools.append(self._audio_import)
+        files.addWidget(self._audio_import)
+        self._audio_song = QPushButton("导入音乐…")
+        self._audio_song.setToolTip(
+            "读一份 .song（一首曲子）放进世界 —— **默认循环、默认全局**（背景音乐不跟位置走）")
+        self._audio_song.clicked.connect(self._import_song)
+        self._audio_tools.append(self._audio_song)
+        files.addWidget(self._audio_song)
+        self._audio_save = QPushButton("保存")
+        self._audio_save.setToolTip("把这一份存成一个 .scene")
+        self._audio_save.clicked.connect(self._save_audio_scene)
+        self._audio_tools.append(self._audio_save)
+        files.addWidget(self._audio_save)
+        self._audio_export = QPushButton("导出 WAV")
+        self._audio_export.setToolTip("把当前这一份整体混成一个 .wav（不影响正在响的那一路）")
+        self._audio_export.clicked.connect(self._export_wav)
+        self._audio_tools.append(self._audio_export)
+        files.addWidget(self._audio_export)
+        files.addStretch(1)
+        layout.addLayout(files)
+
+        self._audio_view = Viewport()
+        self._audio_view.set_fill(True)   # 画面按面板形状出，所以铺满，不留黑边
+        for signal, slot in ((self._audio_view.key, self._on_view_key),
+                             (self._audio_view.moved, self._on_view_moved),
+                             (self._audio_view.clicked, self._on_view_clicked),
+                             (self._audio_view.wheeled, self._on_view_wheeled)):
+            signal.connect(slot)
+        # 左边一列**声源**（大纲），右边是画面 —— 和建模页一个位置。
+        self._audio_sources: list[tuple[int, str]] = []
+        self._audio_active = -1
+        self._audio_syncing = False
+        # 活动音效那份配方：波形 + 八个参数。程序每次把活动音效的参数**回推**过来就更新它，
+        # 对话框打开时用它填初值（默认那组 = 程序放下一个「音效」时的那份 zap）。
+        self._audio_synth = (2, 1200.0, 300.0, 0.22, 0.004, 0.06, 0.25, 0.12, 0.0)
+        # 音符格子那一份：宿主推过来的（速度、一遍拍数、乐器数）+ 一串音符。`_timeline_has_song`
+        # 决定那块面板出不出来 —— 选中的是曲子才有。
+        self._timeline_song = (120.0, 4.0, 1)
+        self._timeline_notes: list[tuple[float, float, int, float, int]] = []
+        self._timeline_instruments: list[tuple] = []
+        self._timeline_has_song = False
+        self._reporting_play = False
+        self._instrument_dialog: InstrumentDialog | None = None
+        self._audio_objects = QListWidget()
+        self._audio_objects.setToolTip("世界里的声源。点一个就选中它，再拖它 / 改它的音量、距离。")
+        self._audio_objects.currentRowChanged.connect(self._on_audio_row)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._audio_objects)
+        split.addWidget(self._audio_view)
+        split.setStretchFactor(1, 1)
+        split.setSizes([170, 630])
+
+        # **音符格子**：选中的是一首曲子的时候才出来。它画的是宿主推过来的那份曲子（模型在 C++ 那头
+        # —— 见 `timeline.py`），鼠标动作走 `command` → 一行 `V …` 写回去。放在下面一条，默认矮一点；
+        # 想大就拖那条分隔线。
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("音符格子："))
+        controls.addWidget(QLabel("速度"))
+        self._timeline_tempo = QDoubleSpinBox()
+        self._timeline_tempo.setRange(20.0, 400.0)
+        self._timeline_tempo.setDecimals(1)
+        self._timeline_tempo.setSingleStep(1.0)
+        self._timeline_tempo.setToolTip("速度（BPM）——回车或者点别处就生效")
+        self._timeline_tempo.editingFinished.connect(self._on_tempo_edited)
+        controls.addWidget(self._timeline_tempo)
+        controls.addWidget(QLabel("BPM"))
+        controls.addWidget(QLabel("一遍"))
+        self._timeline_loop = QDoubleSpinBox()
+        self._timeline_loop.setRange(0.25, 256.0)
+        self._timeline_loop.setDecimals(2)
+        self._timeline_loop.setSingleStep(1.0)
+        self._timeline_loop.setToolTip("一遍多少拍 —— 渲染出来的长度就是它")
+        self._timeline_loop.editingFinished.connect(self._on_loop_edited)
+        controls.addWidget(self._timeline_loop)
+        controls.addWidget(QLabel("拍"))
+        self._timeline_save = QPushButton("保存曲子")
+        self._timeline_save.setToolTip("把格子上改的这一份写成 .song（不按它，磁盘上那份还是旧的）")
+        self._timeline_save.clicked.connect(self._save_song)
+        controls.addWidget(self._timeline_save)
+        self._timeline_instruments_button = QPushButton("乐器…")
+        self._timeline_instruments_button.setToolTip(
+            "编辑这首曲子的乐器：波形、包络（起音/衰减/持续/释音）、增益、低通 —— 改一下就听得到")
+        self._timeline_instruments_button.clicked.connect(self._open_instruments)
+        controls.addWidget(self._timeline_instruments_button)
+        controls.addStretch(1)
+        self._timeline_hint = QLabel("")
+        controls.addWidget(self._timeline_hint)
+        for made in (self._timeline_tempo, self._timeline_loop, self._timeline_save,
+                     self._timeline_instruments_button):
+            self._audio_tools.append(made)
+
+        self._audio_timeline = TimelineView()
+        self._audio_timeline.command.connect(self._on_timeline_command)
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(2)
+        panel_layout.addLayout(controls)
+        panel_layout.addWidget(self._audio_timeline, 1)
+        self._audio_timeline_panel = panel
+        panel.setVisible(False)
+
+        vertical = QSplitter(Qt.Orientation.Vertical)
+        vertical.addWidget(split)
+        vertical.addWidget(panel)
+        vertical.setStretchFactor(0, 3)
+        vertical.setStretchFactor(1, 1)
+        vertical.setSizes([400, 200])
+        layout.addWidget(vertical, 1)
+
+        hint = QHBoxLayout()
+        hint_label = QLabel("听者 = 相机：**转视角就是转头**（左右一转，声像跟着走）　·　"
+                            "左键 选/拖声源（拖着挪 = 换声像、换远近）　·　右键拖动 转视角　·　"
+                            "中键拖动 平移　·　滚轮 远近　｜　"
+                            "键：空格 播放/暂停 · L 循环 · M 静音 · G 全局 · X 删除 · ↑↓ 换一个 · Z 撤销　｜　"
+                            "「音调」「噪声」「音效」点一下拿到手里，再左键放到画面上；"
+                            "选中一个音效，用「音效…」调它的波形/包络　｜　"
+                            "背景音乐：从菜单新建一份「曲子」，写好后用「导入音乐…」放进来（默认循环、全局）")
+        hint_label.setWordWrap(True)   # 不换行的话，这一长条的最小宽度会把整页撑得极宽、反挤画布
+        hint.addWidget(hint_label)
+        hint.addStretch(1)
+        self._audio_frame_label = QLabel("")
+        hint.addWidget(self._audio_frame_label)
+        layout.addLayout(hint)
+
+        self._audio_tools_enabled(False)
+        return page
+
     def _show_page(self, index: int) -> None:
-        """切页。切到建模那一页时顺手把建模器起起来 —— 进去就是能用的。"""
+        """切页。切到工具那一页时顺手把那个工具起起来 —— 进去就是能用的。"""
         self._pages.setCurrentIndex(index)
-        (self.act_page_code, self.act_page_model)[index].setChecked(True)
-        if index != _PAGE_MODEL:
+        (self.act_page_code, self.act_page_model, self.act_page_audio)[index].setChecked(True)
+        if index == _PAGE_MODEL:
+            start, view, button = self._start_model, self._model_view, self._model_start
+        elif index == _PAGE_AUDIO:
+            start, view, button = self._start_audio, self._audio_view, self._audio_play
+        else:
             return
         if not self._runner.running():
-            self._start_model()
+            start()
         else:
-            # 有东西在跑（一道 Run 或者上一次的建模器）。**不抢** —— 悄悄把别人踩掉是最难查的
-            # 那种意外；想换就自己按「开始建模」。
-            self._model_start.setToolTip("有东西在跑。按「停止」再进来，或者直接点这里换掉它")
-        if self._model_view.isVisible():
-            self._model_view.setFocus(Qt.FocusReason.OtherFocusReason)
+            # 有东西在跑（一道 Run 或者上一次的工具）。**不抢** —— 悄悄把别人踩掉是最难查的
+            # 那种意外；想换就自己按那个「开始 / 重开」按钮。
+            button.setToolTip("有东西在跑。按「停止」再进来，或者直接点这里换掉它")
+        if view.isVisible():
+            view.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _start_model(self) -> None:
         """起建模器。
@@ -459,10 +813,13 @@ class EditorWindow(QMainWindow):
         except ValueError as problem:
             QMessageBox.warning(self, "参数读不了", str(problem))
             return
-        arguments = self._model_render_size(arguments)
+        arguments = self._render_size(arguments, self._model_view)
 
         # 先记下"这一轮画在建模那一页上"，`_start` 才知道该擦哪块面板。
         self._model_running = True
+        self._model_objects.clear()   # 上一轮的对象表作废；新的一起来会自己填
+        self._model_scene = []
+        self._model_active = -1
         self._start(f"$ {program.name} {' '.join(arguments)}".rstrip(), _RUNNING)
         self._runner.run(program_command(program, arguments, self._package))
         # 记住过哪个模型就顺手读进来 —— 进这一页，上次那个东西就在。**现在发出去没关系**：这几行
@@ -475,13 +832,13 @@ class EditorWindow(QMainWindow):
         self._model_tools_enabled(True)
         self._model_start.setText("重开建模")
 
-    def _model_render_size(self, arguments: list[str]) -> list[str]:
-        """让建模器**按这块面板的形状**出图，而不是拿一个固定的 800×500 去塞。
+    def _render_size(self, arguments: list[str], view: Viewport) -> list[str]:
+        """让那个工具**按这块面板的形状**出图，而不是拿一个固定的 800×500 去塞。
 
         固定的后果就是两边留黑边：面板越宽，黑边越宽，看上去就是"这块画面很小，没铺满"。按面板
-        的形状出图，图就铺到底、铺到边。
+        的形状出图，图就铺到底、铺到边（两个工具共用这一套）。
 
-        **像素总数不涨**：保持建模器自己那个 `800×500` 的份量，只把形状换成面板的。那一套默认值是
+        **像素总数不涨**：保持工具自己那个 `800×500` 的份量，只把形状换成面板的。那一套默认值是
         量着帧率挑的（见 `宿主/modeler` 开头那张表：800×500 是 54 帧档，1024×640 掉到 34 帧），
         而像素是软件光栅化出来的 —— 想更清楚就把 `_MODEL_PIXELS` 调大，代价是帧率，一句话的事。
 
@@ -489,7 +846,7 @@ class EditorWindow(QMainWindow):
         """
         if any(a.startswith("--width") or a.startswith("--height") for a in arguments):
             return arguments
-        room = self._model_view.room()
+        room = view.room()
         if room.isEmpty():
             return arguments
         pixels = room.width() * room.height()
@@ -506,6 +863,371 @@ class EditorWindow(QMainWindow):
                 return candidate
         return None
 
+    def _start_audio(self) -> None:
+        """起音频器。
+
+        和起建模器是同一条路：子进程，画面从 stderr 回来、鼠标键盘从 stdin 过去，按成品启动、
+        **不用编** —— 包里那个是打包时装好的。区别是它会出声：混音走声卡，见 `宿主/audio/main.cpp`。
+        """
+        program = self._find_audio()
+        if program is None:
+            self._console.append_line("[没有音频器] 找的是这两条：")
+            for parts in _AUDIO_PATHS:
+                self._console.append_line(f"  {self._package.joinpath(*parts)}")
+            self._console.append_line("  源码树里跑一次 `python 打包.py` 就有了")
+            return
+
+        try:
+            arguments = split_arguments(self._arguments.text())
+        except ValueError as problem:
+            QMessageBox.warning(self, "参数读不了", str(problem))
+            return
+        arguments = self._render_size(arguments, self._audio_view)
+
+        # 先记下"这一轮画在音频那一页上"，`_start` 才知道该擦哪块面板、`_on_scene` 才知道声源表
+        # 落到哪个大纲里。
+        self._audio_running = True
+        self._audio_sources = []
+        self._audio_active = -1
+        self._audio_objects.clear()
+        # 音符格子跟着上一轮作废；新的一起来会自己填（见 `_apply_timeline`）。
+        self._timeline_notes = []
+        self._timeline_instruments = []
+        self._timeline_has_song = False
+        self._reporting_play = False
+        self._audio_timeline.clear()
+        self._audio_timeline_panel.setVisible(False)
+        self._close_instruments()
+        self._start(f"$ {program.name} {' '.join(arguments)}".rstrip(), _RUNNING)
+        self._runner.run(program_command(program, arguments, self._package))
+        # 记住过哪个场景就顺手读进来 —— 进这一页，上次那份就在。这几行躺在管子里，子进程起来之后
+        # 自己会读到。
+        remembered = self._audio_scene_path()
+        if remembered:
+            self._runner.write(f"L {remembered}\n")
+        self._audio_view.set_capturing(True)
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._audio_tools_enabled(True)
+        self._audio_play.setText("重开音频器")
+
+    def _find_audio(self) -> Path | None:
+        """音频器在哪，或者 None。和 `_find_modeler` 一个顺序，见 `_AUDIO_PATHS`。"""
+        for parts in _AUDIO_PATHS:
+            candidate = self._package.joinpath(*parts)
+            if candidate.is_file():
+                return candidate
+        return None
+
+    # -- 音频页上的那些按钮 -------------------------------------------------------------------
+    #
+    # 按键走 `K`，声源种类走 `P <号>`，参数走 `V <名字> <数>`，文件走 `S` / `L` / `I` / `E`。
+    # 协议的两头分别在 `宿主/editor_host.h` 的 `consume` 和这一页这几个方法 —— 改一处要改两处。
+
+    def _on_audio_key(self, key: int) -> None:
+        self._runner.write(f"K {key} 1\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_audio_sound(self, kind: int) -> None:
+        self._runner.write(f"P {kind}\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _send_value(self, name: str, *numbers: float) -> None:
+        """`V <名字> <数…>`。带符号的是"加这个数"，程序那头按加减理解（见 `ApplyValue`）。
+
+        不给数也对（`V global` 就是一个翻转开关）—— 那样行尾就不该留一个空格。
+        """
+        parts = " ".join(f"{number:g}" for number in numbers)
+        self._runner.write(f"V {name} {parts}".rstrip() + "\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _audio_frequency(self) -> None:
+        value, ok = QInputDialog.getDouble(
+            self, "频率", "选中音调的频率（Hz）：", 440.0, 20.0, 20000.0, 1)
+        if ok:
+            self._send_value("freq", value)
+
+    def _audio_length_dialog(self) -> None:
+        value, ok = QInputDialog.getDouble(
+            self, "长度", "选中声源的长度（秒）：", 0.5, 0.02, 30.0, 2)
+        if ok:
+            self._send_value("length", value)
+
+    def _audio_synth_dialog(self) -> None:
+        """把选中的**合成音效**调一遍。一趟出去是五条 `V`：波形、起止频率、长度、包络、低通。
+
+        初值取程序**回推**过来的那份配方（`_on_audio_scene` 的 `synth` 那行）—— 所以打开一个存过的
+        场景再打开这个框，显示的是文件里那份，不是面板上一次敲的。改完立刻重渲染，能直接听。
+        """
+        wave, *rest = self._audio_synth
+        dialog = QDialog(self)
+        dialog.setWindowTitle("音效（合成）")
+        form = QFormLayout(dialog)
+
+        wave_box = QComboBox()
+        for label in ("正弦", "方波", "锯齿", "三角", "噪声"):
+            wave_box.addItem(label)
+        wave_box.setCurrentIndex(max(0, min(int(wave), 4)))
+        form.addRow("波形", wave_box)
+
+        boxes: dict[str, QDoubleSpinBox] = {}
+        for key, label, _default, low, high, step, decimals in _AUDIO_SYNTH_FIELDS:
+            box = QDoubleSpinBox()
+            box.setRange(low, high)
+            box.setSingleStep(step)
+            box.setDecimals(decimals)
+            box.setValue(rest[len(boxes)])
+            form.addRow(label, box)
+            boxes[key] = box
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        values = [boxes[key].value() for key, *_ in _AUDIO_SYNTH_FIELDS]
+        self._audio_synth = (wave_box.currentIndex(), *values)
+        self._send_value("wave", float(wave_box.currentIndex()))
+        self._send_value("freq", values[0], values[1])
+        self._send_value("length", values[2])
+        self._send_value("envelope", values[3], values[4], values[5], values[6])
+        self._send_value("cutoff", values[7])
+
+    def _audio_scene_path(self) -> str:
+        """上次用的那个场景文件。空字符串就是还没有过。"""
+        return str(self._settings.value("audio/scene", ""))
+
+    def _remember_audio_scene(self, path: str) -> None:
+        self._settings.setValue("audio/scene", path)
+
+    def _audio_folder(self) -> str:
+        path = self._audio_scene_path()
+        return str(Path(path).parent) if path else str(self._package)
+
+    def _open_audio_scene(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开一个场景", self._audio_folder(), "场景 (*.scene);;所有文件 (*)")
+        if not path:
+            return
+        self._remember_audio_scene(path)
+        self._runner.write(f"L {path}\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _import_wav(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入一个 WAV", self._audio_folder(), "WAV (*.wav);;所有文件 (*)")
+        if not path:
+            return
+        self._runner.write(f"I {path}\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _import_song(self) -> None:
+        """读一份 `.song`（一首曲子）放进世界。进来之后在左边选中它，下面那块**音符格子**就能编了。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入一首曲子", self._audio_folder(), "曲子 (*.song);;所有文件 (*)")
+        if not path:
+            return
+        self._remember_audio_song(path)   # 「保存曲子」默认写回它来的那一份
+        self._runner.write(f"U {path}\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _save_song(self) -> None:
+        """把格子上改的这一份写成 `.song`。没存过就先问一个地方，之后就一直是那儿了。"""
+        path = self._audio_song_path()
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "曲子存到哪儿", self._audio_folder(), "曲子 (*.song)")
+            if not path:
+                return
+            self._remember_audio_song(path)
+        self._runner.write(f"B {path}\n")
+        self._audio_timeline.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _audio_song_path(self) -> str:
+        """上次那份曲子住在哪儿。空字符串就是还没有过。"""
+        return str(self._settings.value("audio/song", ""))
+
+    def _remember_audio_song(self, path: str) -> None:
+        self._settings.setValue("audio/song", path)
+
+    def _open_instruments(self) -> None:
+        """开乐器编辑器。
+
+        **模态**（`exec()`），但它自己那个嵌套事件循环里，帧和推表照常进来 —— 所以左边那份列表和右边
+        那些参数一直跟着宿主走（见 `_apply_timeline`）。试听是循环的，所以**关掉的时候一定要说一声**
+        （`InstrumentDialog.accept` / `closeEvent` 里已经做了）。
+        """
+        if self._instrument_dialog is not None:
+            return
+        dialog = InstrumentDialog(self)
+        dialog.command.connect(self._on_timeline_command)
+        dialog.set_instruments(self._timeline_instruments)
+        self._instrument_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._instrument_dialog = None
+            dialog.deleteLater()
+
+    def _close_instruments(self) -> None:
+        """宿主那边没曲子了（或者停了）：把编辑器收起来。
+
+        `reject()` 让 `exec()` 返回，接着 `_open_instruments` 把引用清掉 —— 这里**不**自己清，免得
+        和那条路打架。
+        """
+        dialog = self._instrument_dialog
+        if dialog is not None:
+            dialog.reject()
+
+    def _save_audio_scene(self) -> None:
+        path = self._audio_scene_path()
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "存到哪儿", self._audio_folder(), "场景 (*.scene)")
+            if not path:
+                return
+            self._remember_audio_scene(path)
+        self._runner.write(f"S {path}\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _export_wav(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 WAV", self._audio_folder(), "WAV (*.wav)")
+        if not path:
+            return
+        self._runner.write(f"E {path}\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_audio_scene(self, line: str) -> None:
+        """音频器把**声源表**发回来了（和建模器同一个哨兵前缀）—— 重建那个列表。
+
+        行是 `begin` / `obj <号> <名字>` / `sel <号>` / `end`，和建模器一套格式；**另外多三种**：
+        活动声源是合成音效时一行 `synth …`（给对话框填初值），是一首曲子时一行 `song …` 加一串
+        `note …`（给音符格子画），以及（说了 `R 1` 之后）`play <拍>`。它们都在同一对 `begin`/`end`
+        里 —— 一次推一整套，重画就完了，不用增量。
+        """
+        body = line[len(SCENE_PREFIX):].strip()
+        if body == "begin":
+            self._audio_sources = []
+            self._timeline_notes = []
+            self._timeline_instruments = []
+            self._timeline_has_song = False
+        elif body == "end":
+            self._audio_syncing = True
+            self._audio_objects.clear()
+            for index, name in self._audio_sources:
+                self._audio_objects.addItem(f"{index}   {name}")
+            self._audio_objects.setCurrentRow(self._audio_active)
+            self._audio_syncing = False
+            self._apply_timeline()
+        else:
+            word, _, rest = body.partition(" ")
+            if word == "obj":
+                index, _, name = rest.partition(" ")
+                self._audio_sources.append((int(index), name))
+            elif word == "sel":
+                self._audio_active = int(rest)
+            elif word == "synth":
+                # 活动声源是合成音效时，程序把它的配方回推过来：`synth <波形> <f0> <f1> <秒> <起音>
+                # <衰减> <持续> <释音> <低通>`，固定顺序。面板拿它填那个对话框的初值。
+                numbers = rest.split()
+                if len(numbers) >= 9:
+                    values = [float(number) for number in numbers[:9]]
+                    self._audio_synth = (int(values[0]), *values[1:])
+            elif word == "song":
+                # `song <速度> <一遍拍数> <乐器数>` —— 后面跟着的就是这一首的音符。
+                numbers = rest.split()
+                if len(numbers) >= 3:
+                    self._timeline_song = (float(numbers[0]), float(numbers[1]), int(numbers[2]))
+                    self._timeline_has_song = True
+            elif word == "note":
+                # `note <起点> <长度> <音高> <力度> <乐器>` —— 顺序就是序号。
+                numbers = rest.split()
+                if len(numbers) >= 5:
+                    self._timeline_notes.append((float(numbers[0]), float(numbers[1]),
+                                                 int(numbers[2]), float(numbers[3]),
+                                                 int(numbers[4])))
+            elif word == "instrument":
+                # `instrument <序号> <波形> <起音> <衰减> <持续> <释音> <增益> <低通> <种子>` ——
+                # 顺序就是序号，所以存的是除序号之外的那八个。
+                numbers = rest.split()
+                if len(numbers) >= 9:
+                    self._timeline_instruments.append((
+                        int(float(numbers[1])), float(numbers[2]), float(numbers[3]),
+                        float(numbers[4]), float(numbers[5]), float(numbers[6]),
+                        float(numbers[7]), int(float(numbers[8]))))
+            elif word == "play":
+                try:
+                    self._audio_timeline.set_playhead(float(rest))
+                except ValueError:
+                    pass
+
+    def _apply_timeline(self) -> None:
+        """一次推完之后：有曲子就把格子亮出来，没有就收起来。
+
+        **播放头的上报也跟着这个开关走** —— 只在看得见格子的时候说 `R 1`，不然程序白报一路。
+        """
+        if self._timeline_has_song:
+            tempo, loop, instruments = self._timeline_song
+            self._audio_timeline.set_song(tempo, loop, instruments, self._timeline_notes)
+            # 只在**用户没在编它们**的时候回填，否则一边打字一边被推回来的值顶掉。
+            if not self._timeline_tempo.hasFocus():
+                self._timeline_tempo.setValue(tempo)
+            if not self._timeline_loop.hasFocus():
+                self._timeline_loop.setValue(loop)
+            self._timeline_hint.setText(f"{len(self._timeline_notes)} 个音符")
+            self._timeline_instruments_button.setEnabled(True)
+            # 乐器编辑器开着的话，让它跟着宿主这份走（列表和参数）。它正在编的那个框自己会让着。
+            if self._instrument_dialog is not None:
+                self._instrument_dialog.set_instruments(self._timeline_instruments)
+            # **用 `isHidden()` 而不是 `isVisible()`**：切到别的页时整条这一页都是"不可见"的，
+            # 那时候 `isVisible()` 永远是假，就会一直重复 `setVisible`、而藏的时候又藏不掉。
+            if self._audio_timeline_panel.isHidden():
+                self._audio_timeline_panel.setVisible(True)
+            self._set_report_play(True)
+        else:
+            if not self._audio_timeline_panel.isHidden():
+                self._audio_timeline_panel.setVisible(False)
+                self._audio_timeline.clear()
+            self._timeline_instruments_button.setEnabled(False)
+            self._close_instruments()   # 没曲子了，乐器编辑器就没有来源了
+            self._set_report_play(False)
+
+    def _set_report_play(self, on: bool) -> None:
+        """要不要程序每帧报播放位置（`R <0|1>`）。**只在变了的时候说一次**，不然每推一次表就发一行。"""
+        if on == self._reporting_play:
+            return
+        self._reporting_play = on
+        self._runner.write(f"R {1 if on else 0}\n")
+
+    def _on_timeline_command(self, name: str, numbers: list) -> None:
+        """音符格子动了：转成一行 `V <名字> <数…>`。
+
+        **不把焦点还给 3D 画面**（`_send_value` 会还）—— 焦点得留在格子上，`Delete` 才删得掉，
+        接着拖下一个音符也才连得上。
+        """
+        parts = " ".join(f"{number:g}" for number in numbers)
+        self._runner.write(f"V {name} {parts}".rstrip() + "\n")
+
+    def _on_tempo_edited(self) -> None:
+        self._send_value("tempo", self._timeline_tempo.value())
+
+    def _on_loop_edited(self) -> None:
+        self._send_value("songloop", self._timeline_loop.value())
+
+    def _on_audio_row(self, row: int) -> None:
+        """大纲里点了一行：告诉音频器把第 row 个声源选成活动声源。"""
+        if row < 0 or self._audio_syncing:
+            return
+        self._runner.write(f"N {row}\n")
+        self._audio_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _audio_tools_enabled(self, on: bool) -> None:
+        for button in self._audio_tools:
+            button.setEnabled(on)
+
     def _on_model_tool(self, key: int) -> None:
         """工具条上按了一下：替用户敲一下那个键，然后**把焦点还给画面**。
 
@@ -513,6 +1235,57 @@ class EditorWindow(QMainWindow):
         落空了。
         """
         self._runner.write(f"K {key} 1\n")
+        self._model_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_model_primitive(self, kind: int) -> None:
+        """图元那一排按了一下：**手里拿上一个形状**，下一次在画面上左键就把它放下。
+
+        发的是 `P <图元号>`，不是一次按键 —— 形状是个值，敲键带不走它（见 `_MODEL_PRIMITIVES`）。
+        发完照样把焦点还给画面，不然紧接着的那次左键落在编辑器上，形状就放不下去。
+        """
+        self._runner.write(f"P {kind}\n")
+        self._model_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_scene(self, line: str) -> None:
+        """子进程发回来的一张结构表（对象 / 声源）—— **按现在跑的是谁**分流到大纲。
+
+        两个工具用的是同一个哨兵前缀和同一套行（`begin` / `obj` / `sel` / `end`），所以分流只要看
+        `_audio_running`：跑的是音频器就填声源列表，否则填对象列表。
+        """
+        if self._audio_running:
+            self._on_audio_scene(line)
+        else:
+            self._on_model_scene(line)
+
+    def _on_model_scene(self, line: str) -> None:
+        """建模器把**对象表**发回来了（带哨兵前缀，见 `runtime.SCENE_PREFIX`）—— 重建那个列表。
+
+        行是 `begin` / `obj <号> <名字>` / `sel <号>` / `end`。名字里可以有空格，所以取的是"号之后
+        的全部"。重建时把 `_model_syncing` 立起来，免得 `setCurrentRow` 又发一条 `N` 回去。
+        """
+        body = line[len(SCENE_PREFIX):].strip()
+        if body == "begin":
+            self._model_scene = []
+        elif body == "end":
+            self._model_syncing = True
+            self._model_objects.clear()
+            for index, name in self._model_scene:
+                self._model_objects.addItem(f"{index}   {name}")
+            self._model_objects.setCurrentRow(self._model_active)
+            self._model_syncing = False
+        else:
+            word, _, rest = body.partition(" ")
+            if word == "obj":
+                index, _, name = rest.partition(" ")
+                self._model_scene.append((int(index), name))
+            elif word == "sel":
+                self._model_active = int(rest)
+
+    def _on_model_row(self, row: int) -> None:
+        """大纲里点了一行：告诉建模器把第 row 个对象选成活动对象。"""
+        if row < 0 or self._model_syncing:
+            return
+        self._runner.write(f"N {row}\n")
         self._model_view.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _model_tools_enabled(self, on: bool) -> None:
@@ -532,7 +1305,7 @@ class EditorWindow(QMainWindow):
 
         颜色是**四个 0..1 的数**发下去的（不是 Qt 那个 `QColor`）—— 管子里没有对象，只有数。
         """
-        colour = QColorDialog.getColor(QColor(200, 205, 215), self, "给选中的面挑一个颜色")
+        colour = QColorDialog.getColor(QColor(200, 205, 215), self, "给选中的东西挑一个颜色")
         if not colour.isValid():
             return
         self._runner.write(f"A {colour.redF():.6f} {colour.greenF():.6f} "
@@ -549,6 +1322,24 @@ class EditorWindow(QMainWindow):
         if not path:
             return
         self._runner.write(f"T {path}\n")
+        self._model_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _insert_picture(self) -> None:
+        """往场景里放一张图（BMP），落在画面中央。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "挑一张图", self._model_folder(), "BMP 图 (*.bmp);;所有文件 (*)")
+        if not path:
+            return
+        self._runner.write(f"J {path}\n")
+        self._model_view.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _export_scene(self) -> None:
+        """把整个场景导出成一个 .scene（游戏直接读）。"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出场景", self._model_folder(), "场景 (*.scene)")
+        if not path:
+            return
+        self._runner.write(f"E {path}\n")
         self._model_view.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _open_model(self) -> None:
@@ -600,6 +1391,8 @@ class EditorWindow(QMainWindow):
         **按跑的是什么分，不按在看哪一页** —— 建模器跑到代码那一页的面板上，看起来就像刚跑了
         个游戏。
         """
+        if self._audio_running:
+            return self._audio_view
         return self._model_view if self._model_running else self._viewport
 
     def _build_menus(self) -> None:
@@ -647,6 +1440,7 @@ class EditorWindow(QMainWindow):
         bar.setObjectName("main")
         bar.addAction(self.act_page_code)
         bar.addAction(self.act_page_model)
+        bar.addAction(self.act_page_audio)
         bar.addSeparator()
         for action in (self.act_new, self.act_open, self.act_save):
             bar.addAction(action)
@@ -886,9 +1680,10 @@ class EditorWindow(QMainWindow):
         if editor is None:
             return
 
-        # F5 跑的是手上这个文件，不是建模器 —— 于是画面回到代码那一页的面板上。**在这里说一次
-        # 就够了**：`_run` 是所有 Run 的入口，`_build_then_run` 也是从这儿来的。
+        # F5 跑的是手上这个文件，不是建模器/音频器 —— 于是画面回到代码那一页的面板上。**在这里说
+        # 一次就够了**：`_run` 是所有 Run 的入口，`_build_then_run` 也是从这儿来的。
         self._model_running = False
+        self._audio_running = False
 
         target = self._path_of(editor)
         if target is None or editor.document().isModified():
@@ -918,6 +1713,7 @@ class EditorWindow(QMainWindow):
         self._active_view().clear()
         self._frame_label.setText("")
         self._model_frame_label.setText("")
+        self._audio_frame_label.setText("")
         self._mirror.stop()
         self.act_run.setEnabled(False)
         self.act_stop.setEnabled(True)
@@ -927,8 +1723,17 @@ class EditorWindow(QMainWindow):
         self._mirror.stop()
         self._viewport.set_capturing(False)
         self._model_view.set_capturing(False)
+        self._audio_view.set_capturing(False)
         self._model_tools_enabled(False)
+        self._audio_tools_enabled(False)
         self._model_running = False
+        self._audio_running = False
+        # 曲子那块也收起来：跑着的东西没了，它就没有来源了。
+        self._reporting_play = False
+        self._timeline_has_song = False
+        self._audio_timeline.clear()
+        self._audio_timeline_panel.setVisible(False)
+        self._close_instruments()
         self.act_run.setEnabled(self._current_editor() is not None)
         self.act_pack.setEnabled(self._current_editor() is not None)
         self.act_stop.setEnabled(False)
@@ -943,6 +1748,11 @@ class EditorWindow(QMainWindow):
         self._console.append_line(line)
 
     def _on_frame(self, rgba: bytes, pitch: int, width: int, height: int) -> None:
+        if self._audio_running:
+            self._audio_view.show_frame(rgba, pitch, width, height)
+            self._audio_frame_label.setText(
+                f"{width}×{height} · 第 {self._audio_view.frames} 帧")
+            return
         if self._model_running:
             self._model_view.show_frame(rgba, pitch, width, height)
             self._model_frame_label.setText(
@@ -968,9 +1778,23 @@ class EditorWindow(QMainWindow):
     #     S <路径>                         存到这个路径
     #     L <路径>                         从这个路径读自己的模型
     #     I <路径>                         从这个路径导入别人的网格文件
+    #     T <路径>                         给选中的面挂上这个路径的一张图
+    #     J <路径>                         往场景里放一张图（一块贴着它的平面对象）
+    #     E <路径>                         把整个场景导出到这个 .scene
+    #     P <图元号>                        手里拿上一个图元（1 方块 / 2 网格 / 3 圆盘 / 4 圆柱 /
+    #                                       5 圆锥 / 6 球 / 7 圆环 / 8 金字塔 / 9 圆台），
+    #                                       下一次左键就把它放在画面上
+    #     V <名字> <数…>                    把某个参数设成这个值（音频工具：gain / reference /
+    #                                       max / master / loop / mute / freq / length）
     #
-    # 后三行的路径是**整行剩下的全部**，不分词 —— 路径里有空格，按空白切会把它切成两半。它们
-    # 也不走键盘那条路：见 `_open_model` 上面那段，路径只能从管子里送。
+    # **`L` / `I` / `E` / `P` 是"一个字母、两套含义"**：建模器把它们读成"读自己的模型 / 导入 OBJ /
+    # 导出场景 / 放一个图元"，音频器把它们读成"读一个场景 / 导入 WAV / 导出 WAV / 放一段声源"。
+    # 两个工具从不同时跑，面板发的话是给**正在跑的那一个**的，所以一个字母够用 —— 而每个工具认不出
+    # 的行丢掉，所以将来多一种消息不会让旧的程序炸掉。
+    #
+    # 带路径的那几条是**整行剩下的全部**，不分词 —— 路径里有空格，按空白切会把它切成两半。它们
+    # 也不走键盘那条路：见 `_open_model` 上面那段，路径只能从管子里送。`P` 带的是一个**号**，和
+    # 上色 `A` 一样属于"值"那一类，不走键盘。
     #
     # 按键那一行带位置，是因为"指针现在在哪"和"这一下按在哪"不是一回事：两者可能落在同一帧里，
     # 去问指针会拿到移动之后的值。落在画面外面的按下没有画面坐标可给，那就只写前两个数，程序

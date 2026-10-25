@@ -3,7 +3,13 @@
 #include "zlong/engine/file_io.h"
 #include "zlong/engine/image_file.h"
 #include "zlong/engine/model_file.h"
+#include "zlong/engine/song_file.h"
+#include "zlong/engine/synth.h"
+#include "zlong/engine/wav_file.h"
 
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <sstream>
@@ -55,6 +61,50 @@ bool Floats(const std::vector<std::string>& tokens, std::size_t first, std::size
         }
     }
     return true;
+}
+
+/// 波形的名字和号在 `synth.h` 里（`SynthWaveName` / `SynthWaveFromName`）—— 场景文本和曲子的
+/// `.song` 文件都要它，所以只留一份。
+
+/// 路径切分，给写出器用。
+///
+/// **不用 `std::filesystem`** —— 它在这个平台上遇到中文会抛（见 `file_io.h`），而这些字符串从头到尾
+/// 都是 UTF-8 的字节，自己切几下就够了。
+bool IsAbsolutePath(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return true;
+    }
+    return path.size() >= 2 && path[1] == ':';
+}
+
+std::string DirOf(const std::string& path) {
+    const std::size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
+
+std::string FileNameOf(const std::string& path) {
+    const std::size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+std::string StemOf(const std::string& path) {
+    std::string name = FileNameOf(path);
+    const std::size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) {
+        name = name.substr(0, dot);
+    }
+    return name.empty() ? std::string("scene") : name;
+}
+
+/// `dir` 和 `name` 拼一条路径；`dir` 空或者 "." 就是当前的 `name`。
+std::string JoinPath(const std::string& dir, const std::string& name) {
+    if (dir.empty() || dir == ".") {
+        return name;
+    }
+    return dir + "/" + name;
 }
 
 }  // namespace
@@ -349,10 +399,145 @@ bool ParseScene(const std::string& text, Scene& out, std::string& error,
                         Translation(v[0], v[1], v[2]) * RotationY(Radians(v[3])) * Scale(v[4]),
                         static_cast<std::int32_t>(parent));
         } else if (head == "sound") {
-            // sound tone FREQUENCY SECONDS | sound noise SECONDS SEED
+            // sound tone FREQUENCY SECONDS | sound noise SECONDS SEED | sound wav PATH
             //
-            // Synthesised rather than loaded, like the textures above: a scene that
-            // needs a file next to it is a scene that cannot be one file.
+            // 前两种是**合成**出来的，像上面那些贴图：一个需要旁边有文件的场景，就不是"一个文件"了。
+            // 第三种是**真的声音**（`wav_file.h`），而它需要旁边有文件 —— 那条路径一直到行尾，相对
+            // 场景文件自己的目录，和 `texture file` / `model` 一条规矩。
+            if (tokens.size() < 2) {
+                return fail("sound needs a kind");
+            }
+            if (tokens[1] == "wav") {
+                if (tokens.size() < 3) {
+                    return fail("sound wav needs a path");
+                }
+                if (base_dir.empty()) {
+                    return fail("this scene loads a wav, so it has to be read with LoadScene -- "
+                                "that is the one that knows which directory the path is relative "
+                                "to");
+                }
+                std::string file = tokens[2];
+                for (std::size_t index = 3; index < tokens.size(); ++index) {
+                    file += " " + tokens[index];
+                }
+                const bool absolute =
+                    (!file.empty() && (file[0] == '/' || file[0] == '\\')) ||
+                    (file.size() > 1 && file[1] == ':');
+                audio::Clip clip;
+                std::string reason;
+                if (!LoadWav(absolute ? file : base_dir + "/" + file, clip, reason)) {
+                    return fail("sound wav: " + reason);
+                }
+                out.sounds.push_back(std::move(clip));
+                continue;
+            }
+            if (tokens[1] == "song") {
+                // `sound song 主题.song` —— 一首曲子（`song_file.h`），渲染成一段。路径一直到行尾、
+                // 相对场景文件自己的目录，和 `sound wav` / `model` 一条规矩。
+                if (tokens.size() < 3) {
+                    return fail("sound song needs a path");
+                }
+                if (base_dir.empty()) {
+                    return fail("this scene loads a song, so it has to be read with LoadScene -- "
+                                "that is the one that knows which directory the path is relative "
+                                "to");
+                }
+                std::string file = tokens[2];
+                for (std::size_t index = 3; index < tokens.size(); ++index) {
+                    file += " " + tokens[index];
+                }
+                const bool absolute =
+                    (!file.empty() && (file[0] == '/' || file[0] == '\\')) ||
+                    (file.size() > 1 && file[1] == ':');
+                SongSpec song;
+                std::string reason;
+                if (!LoadSong(absolute ? file : base_dir + "/" + file, song, reason)) {
+                    return fail("sound song: " + reason);
+                }
+                audio::Clip clip = RenderSong(song);
+                if (!clip.Valid()) {
+                    return fail("sound song: 这首曲子里没有音符（或者一遍的长度不是正的）");
+                }
+                out.sounds.push_back(std::move(clip));
+                continue;
+            }
+            if (tokens[1] == "synth") {
+                // sound synth [wave NAME] [f0 F] [f1 F] [seconds F] [attack F] [decay F] [sustain F]
+                //             [release F] [gain F] [cutoff F] [seed N]
+                //
+                // 关键字后面跟一个值 —— 和 `emitter` 的 `gain G`、`material` 的 `specular F` 同一种
+                // 写法（不是 `key=value`）。**省掉的用默认值**，所以手写一行可以只写要动的几个数；
+                // `SaveScene` 则总是把十一个全写出来。
+                SynthSpec spec;
+                std::size_t at = 2;
+                while (at < tokens.size()) {
+                    const std::string& key = tokens[at];
+                    if (key == "wave") {
+                        if (at + 1 >= tokens.size()) {
+                            return fail("sound synth wave needs a name");
+                        }
+                        if (!SynthWaveFromName(tokens[at + 1], spec.wave)) {
+                            return fail("unknown synth wave '" + tokens[at + 1] +
+                                        "' (sine / square / saw / triangle / noise)");
+                        }
+                        at += 2;
+                    } else if (key == "seed") {
+                        long seed = 1;
+                        if (at + 1 >= tokens.size() || !ToInt(tokens[at + 1], seed)) {
+                            return fail("sound synth seed needs a whole number");
+                        }
+                        spec.seed = static_cast<std::uint32_t>(seed);
+                        at += 2;
+                    } else if (key == "f0" || key == "f1" || key == "seconds" || key == "attack" ||
+                               key == "decay" || key == "sustain" || key == "release" ||
+                               key == "gain" || key == "cutoff") {
+                        float value = 0.0f;
+                        if (at + 1 >= tokens.size() || !ToFloat(tokens[at + 1], value)) {
+                            return fail("sound synth " + key + " needs a number");
+                        }
+                        if (key == "f0") {
+                            spec.start_hz = value;
+                        } else if (key == "f1") {
+                            spec.end_hz = value;
+                        } else if (key == "seconds") {
+                            spec.seconds = value;
+                        } else if (key == "attack") {
+                            spec.attack = value;
+                        } else if (key == "decay") {
+                            spec.decay = value;
+                        } else if (key == "sustain") {
+                            spec.sustain = value;
+                        } else if (key == "release") {
+                            spec.release = value;
+                        } else if (key == "gain") {
+                            spec.gain = value;
+                        } else {
+                            spec.cutoff_hz = value;
+                        }
+                        at += 2;
+                    } else {
+                        return fail("sound synth wants wave / f0 / f1 / seconds / attack / decay / "
+                                    "sustain / release / gain / cutoff / seed, not '" + key + "'");
+                    }
+                }
+                if (!(spec.seconds > 0.0f)) {
+                    return fail("sound synth needs a positive length");
+                }
+                if (!(spec.start_hz > 0.0f) || !(spec.end_hz > 0.0f)) {
+                    return fail("sound synth needs positive frequencies");
+                }
+                if (!(spec.gain >= 0.0f)) {
+                    return fail("sound synth gain cannot be negative");
+                }
+                if (!(spec.cutoff_hz >= 0.0f)) {
+                    return fail("sound synth cutoff cannot be negative");
+                }
+                if (spec.sustain < 0.0f || spec.sustain > 1.0f) {
+                    return fail("sound synth sustain is a level from 0 to 1");
+                }
+                out.sounds.push_back(RenderSynth(spec));
+                continue;
+            }
             if (tokens.size() < 4) {
                 return fail("sound needs a kind and its two parameters");
             }
@@ -400,6 +585,10 @@ bool ParseScene(const std::string& text, Scene& out, std::string& error,
                 if (tokens[at] == "loop") {
                     emitter.loop = true;
                     ++at;
+                } else if (tokens[at] == "global") {
+                    // **不跟位置走**：满音量、居中。背景音乐就是这样（`Emitter::spatial`）。
+                    emitter.spatial = false;
+                    ++at;
                 } else if (tokens[at] == "gain" || tokens[at] == "reference" ||
                            tokens[at] == "max") {
                     float value = 0.0f;
@@ -415,7 +604,8 @@ bool ParseScene(const std::string& text, Scene& out, std::string& error,
                     }
                     at += 2;
                 } else {
-                    return fail("emitter wants 'gain <f>', 'reference <f>', 'max <f>' or 'loop'");
+                    return fail("emitter wants 'gain <f>', 'reference <f>', 'max <f>', 'loop' or "
+                                "'global'");
                 }
             }
             out.emitters.push_back(emitter);
@@ -446,6 +636,170 @@ bool LoadScene(const std::string& path, Scene& out, std::string& error) {
     const std::size_t slash = path.find_last_of("/\\");
     const std::string base = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
     return ParseScene(contents, out, error, base);
+}
+
+bool SaveScene(const std::string& path, const SceneDescription& description, std::string& error) {
+    const std::string base = DirOf(path);
+    const std::string stem = StemOf(path);
+
+    std::vector<std::string> model_files;
+    model_files.reserve(description.objects.size());
+
+    for (std::size_t index = 0; index < description.objects.size(); ++index) {
+        MeshDescription mesh = description.objects[index].mesh;   // 拷一份改路径，不动调用方那份
+        const std::string& source_dir = description.objects[index].source_dir;
+
+        // 贴图：解析成能开的路径 -> 拷到场景目录 -> 路径改成文件名。找不到就报错、不写（见头文件）。
+        for (MeshTexture& texture : mesh.textures) {
+            if (texture.path.empty()) {
+                continue;   // 程序里造的图，没有文件可拷
+            }
+            const std::string from =
+                IsAbsolutePath(texture.path) ? texture.path : JoinPath(source_dir, texture.path);
+            const std::string name = FileNameOf(texture.path);
+            const std::string to = JoinPath(base, name);
+            if (from != to) {
+                std::string bytes;
+                if (!ReadWholeFile(from, bytes)) {
+                    error = "texture not found: " + from;
+                    return false;
+                }
+                if (!WriteWholeFile(to, bytes)) {
+                    error = "could not copy texture to " + to;
+                    return false;
+                }
+            }
+            texture.path = name;
+        }
+
+        const std::string file = stem + "_" + std::to_string(index) + ".model";
+        if (!SaveModel(JoinPath(base, file), mesh, error)) {
+            return false;
+        }
+        model_files.push_back(file);
+    }
+
+    // 声音文件也要拷到场景目录旁边，和贴图一样 —— 一份场景要能整包搬走。要找的那个文件不在了就
+    // 报错、不写（`sound wav` / `sound song` 写出去而没有那个文件，读回来就是个开不了的东西）。
+    std::vector<std::string> sound_file_names(description.sounds.size());
+    for (std::size_t index = 0; index < description.sounds.size(); ++index) {
+        const SceneSoundInput& sound = description.sounds[index];
+        if (sound.kind != SceneSoundInput::Kind::Wav && sound.kind != SceneSoundInput::Kind::Song) {
+            continue;
+        }
+        if (sound.path.empty()) {
+            error = "a scene sound points at a file but has no path";
+            return false;
+        }
+        const std::string from =
+            IsAbsolutePath(sound.path) ? sound.path : JoinPath(sound.source_dir, sound.path);
+        const std::string name = FileNameOf(sound.path);
+        const std::string to = JoinPath(base, name);
+        if (from != to) {
+            std::string bytes;
+            if (!ReadWholeFile(from, bytes)) {
+                error = "sound not found: " + from;
+                return false;
+            }
+            if (!WriteWholeFile(to, bytes)) {
+                error = "could not copy sound to " + to;
+                return false;
+            }
+        }
+        sound_file_names[index] = name;
+    }
+
+    // 场景文本。字段的写法照着 `ParseScene` 认的那几种 —— 相机是一行一个字段。
+    std::string text;
+    const auto add = [&text](const char* format, ...) {
+        char buffer[512];
+        va_list args;
+        va_start(args, format);
+        std::vsnprintf(buffer, sizeof(buffer), format, args);
+        va_end(args);
+        text += buffer;
+        text += '\n';
+    };
+
+    const Camera& camera = description.camera;
+    add("camera eye %.9g %.9g %.9g", static_cast<double>(camera.eye.x),
+        static_cast<double>(camera.eye.y), static_cast<double>(camera.eye.z));
+    add("camera target %.9g %.9g %.9g", static_cast<double>(camera.target.x),
+        static_cast<double>(camera.target.y), static_cast<double>(camera.target.z));
+    add("camera up %.9g %.9g %.9g", static_cast<double>(camera.up.x),
+        static_cast<double>(camera.up.y), static_cast<double>(camera.up.z));
+    add("camera fov %.9g", static_cast<double>(camera.fov_y_radians * 180.0f / kPi));
+    add("camera near %.9g", static_cast<double>(camera.near_z));
+    add("camera far %.9g", static_cast<double>(camera.far_z));
+    add("background %.9g %.9g %.9g %.9g", static_cast<double>(description.background[0]),
+        static_cast<double>(description.background[1]), static_cast<double>(description.background[2]),
+        static_cast<double>(description.background[3]));
+    add("ambient %.9g %.9g %.9g", static_cast<double>(description.ambient.x),
+        static_cast<double>(description.ambient.y), static_cast<double>(description.ambient.z));
+    add("shadow %u", description.shadow_map_size);
+    for (const Light& light : description.lights) {
+        add("light %.9g %.9g %.9g %.9g %.9g %.9g", static_cast<double>(light.direction.x),
+            static_cast<double>(light.direction.y), static_cast<double>(light.direction.z),
+            static_cast<double>(light.colour.x), static_cast<double>(light.colour.y),
+            static_cast<double>(light.colour.z));
+    }
+    for (std::size_t index = 0; index < model_files.size(); ++index) {
+        const SceneObjectInput& object = description.objects[index];
+        // 摆放：平移 + 均匀缩放（绕 Y 转写 0 —— 旋转已经烘进点的坐标里了，见头文件）。
+        add("model %s %.9g %.9g %.9g 0 %.9g", model_files[index].c_str(),
+            static_cast<double>(object.position.x), static_cast<double>(object.position.y),
+            static_cast<double>(object.position.z), static_cast<double>(object.scale));
+    }
+
+    // 声音：先每一段自己，再摆它们的人，最后整场的音量。**顺序不能换** —— `ParseScene` 要求
+    // `emitter` 指的那段声音已经读过了。
+    for (std::size_t index = 0; index < description.sounds.size(); ++index) {
+        const SceneSoundInput& sound = description.sounds[index];
+        switch (sound.kind) {
+        case SceneSoundInput::Kind::Tone:
+            add("sound tone %.9g %.9g", static_cast<double>(sound.frequency),
+                static_cast<double>(sound.seconds));
+            break;
+        case SceneSoundInput::Kind::Noise:
+            add("sound noise %.9g %u", static_cast<double>(sound.seconds), sound.seed);
+            break;
+        case SceneSoundInput::Kind::Wav:
+            add("sound wav %s", sound_file_names[index].c_str());
+            break;
+        case SceneSoundInput::Kind::Song:
+            add("sound song %s", sound_file_names[index].c_str());
+            break;
+        case SceneSoundInput::Kind::Synth: {
+            const SynthSpec& spec = sound.synth;
+            add("sound synth wave %s f0 %.9g f1 %.9g seconds %.9g attack %.9g decay %.9g "
+                "sustain %.9g release %.9g gain %.9g cutoff %.9g seed %u",
+                SynthWaveName(spec.wave), static_cast<double>(spec.start_hz),
+                static_cast<double>(spec.end_hz), static_cast<double>(spec.seconds),
+                static_cast<double>(spec.attack), static_cast<double>(spec.decay),
+                static_cast<double>(spec.sustain), static_cast<double>(spec.release),
+                static_cast<double>(spec.gain), static_cast<double>(spec.cutoff_hz), spec.seed);
+            break;
+        }
+        }
+    }
+    for (const SceneEmitterInput& emitter : description.emitters) {
+        // `loop` 和 `global` 只在真是的时候写 —— 它们是开关，不跟数。
+        add("emitter %d %d %.9g %.9g %.9g gain %.9g reference %.9g max %.9g%s%s",
+            static_cast<int>(emitter.sound), static_cast<int>(emitter.parent),
+            static_cast<double>(emitter.position.x), static_cast<double>(emitter.position.y),
+            static_cast<double>(emitter.position.z), static_cast<double>(emitter.gain),
+            static_cast<double>(emitter.reference_distance),
+            static_cast<double>(emitter.max_distance), emitter.loop ? " loop" : "",
+            emitter.spatial ? "" : " global");
+    }
+    add("master %.9g", static_cast<double>(description.master_gain));
+
+    if (!WriteWholeFile(path, text)) {
+        error = "could not write " + path;
+        return false;
+    }
+    error.clear();
+    return true;
 }
 
 }  // namespace zlong::engine

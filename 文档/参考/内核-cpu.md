@@ -121,6 +121,16 @@ class Core {
     // gets them without reaching for the frontend type.
     void SetPC(std::uint64_t value) { jit_.SetPC(value); }
     void SetSP(std::uint64_t value) { jit_.SetSP(value); }
+    // TPIDR_EL0, the thread pointer.
+    //
+    // dynarmic is handed the address of this member when the JIT is built and
+    // reads through that pointer, so a write here is visible to the next
+    // instruction -- the same contract as SetPC and SetSP, and the same
+    // requirement that the core be stopped.
+    void SetTpidrEl0(std::uint64_t value) { tpidr_el0_ = value; }
+    // TPIDRRO_EL0, the read-only-from-EL0 thread pointer. Same contract as
+    // SetTpidrEl0: dynarmic reads through the address of this member.
+    void SetTpidrroEl0(std::uint64_t value) { tpidrro_el0_ = value; }
     // Write x0..x30. Anything else is discarded (writes to XZR do nothing).
     void WriteGpr(std::size_t index, std::uint64_t value) {
     // --- called by Arm64Interface, on this core's own thread ---------------

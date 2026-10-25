@@ -894,6 +894,492 @@ inline bool BakeMesh(const MeshDescription& description, Mesh& out, std::string&
     return true;
 }
 
+// --- 焊接顶点（布尔运算和建模器都用）--------------------------------------------------------------
+
+/// 把**落在一起**（间距小于 `k`）的点并成一个。就地改 `positions`，返回"旧下标 -> 新下标"。
+///
+/// 用格子加速：每个点只和它所在格以及周围 26 个格里的代表比 —— 平方级在几万个点上是卡住的。
+inline std::vector<std::uint32_t> MergeVertices(std::vector<Vec3>& positions, float k) {
+    const float cell = std::max(k, 1e-5f);
+    std::vector<std::uint32_t> remap(positions.size(), 0);
+    std::map<std::array<int, 3>, std::vector<std::uint32_t>> buckets;
+    std::vector<Vec3> kept;
+    const auto key = [cell](const Vec3& p) {
+        return std::array<int, 3>{static_cast<int>(std::floor(p.x / cell)),
+                                  static_cast<int>(std::floor(p.y / cell)),
+                                  static_cast<int>(std::floor(p.z / cell))};
+    };
+    for (std::size_t i = 0; i < positions.size(); ++i) {
+        const std::array<int, 3> home = key(positions[i]);
+        std::uint32_t found = 0xFFFFFFFFu;
+        for (int dx = -1; dx <= 1 && found == 0xFFFFFFFFu; ++dx) {
+            for (int dy = -1; dy <= 1 && found == 0xFFFFFFFFu; ++dy) {
+                for (int dz = -1; dz <= 1 && found == 0xFFFFFFFFu; ++dz) {
+                    const auto it = buckets.find({home[0] + dx, home[1] + dy, home[2] + dz});
+                    if (it == buckets.end()) {
+                        continue;
+                    }
+                    for (const std::uint32_t candidate : it->second) {
+                        const Vec3 d = Vec3{positions[i].x - kept[candidate].x,
+                                            positions[i].y - kept[candidate].y,
+                                            positions[i].z - kept[candidate].z};
+                        if (d.x * d.x + d.y * d.y + d.z * d.z <= k * k) {
+                            found = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (found != 0xFFFFFFFFu) {
+            remap[i] = found;
+        } else {
+            remap[i] = static_cast<std::uint32_t>(kept.size());
+            buckets[home].push_back(remap[i]);
+            kept.push_back(positions[i]);
+        }
+    }
+    positions = std::move(kept);
+    return remap;
+}
+
+/// 把**没人指着的点丢掉**，面和硬边的下标跟着重排（导入那边也是一个规矩）。
+inline void CompressVertices(MeshDescription& mesh) {
+    std::vector<std::uint32_t> remap(mesh.positions.size(), 0xFFFFFFFFu);
+    std::vector<Vec3> kept;
+    for (Face& face : mesh.faces) {
+        for (std::uint32_t c = 0; c < face.count; ++c) {
+            const std::uint32_t old = face.corners[c];
+            if (remap[old] == 0xFFFFFFFFu) {
+                remap[old] = static_cast<std::uint32_t>(kept.size());
+                kept.push_back(mesh.positions[old]);
+            }
+            face.corners[c] = remap[old];
+        }
+    }
+    mesh.positions = std::move(kept);
+    std::vector<Crease> creases;
+    for (const Crease& crease : mesh.creases) {
+        if (crease.low >= remap.size() || crease.high >= remap.size()) {
+            continue;
+        }
+        const std::uint32_t low = remap[crease.low];
+        const std::uint32_t high = remap[crease.high];
+        if (low != 0xFFFFFFFFu && high != 0xFFFFFFFFu && low != high) {
+            creases.push_back(Crease{std::min(low, high), std::max(low, high)});
+        }
+    }
+    std::sort(creases.begin(), creases.end());
+    creases.erase(std::unique(creases.begin(), creases.end()), creases.end());
+    mesh.creases = std::move(creases);
+}
+
+// --- 图元的**描述形态** ----------------------------------------------------------------------------
+//
+// 上面那六个 `MakeX` 是"编译好的" `Mesh`；这一批是同一批形状的**描述**，交给 `BakeMesh` 去烘。
+// 两者**不是同一份东西，也不求逐字节一样**：`MakeX` 自己带着解析法线、还把接缝复制成了顶点，而描述
+// 是**焊接**的（一个位置一条），平滑的法线交给 `BakeMesh` 按邻面平均算。所以这里要的是"形状对、落
+// 在对的地方"，不是"和 `MakeX` 一模一样"—— `MakeBox` 那种逐字节的可比性在这里不成立，也不该求。
+//
+// 焊接带来两条必须守的规矩，每个函数里都写了：
+//   * **接缝靠逐角 uv。** 一圈是 n 个位置（不是 n+1 个）；收口那个面引用第 0 列，但把它的 u 写成 1.0。
+//     uv 是**逐角**的，所以同一个位置能在两个面上给出两个 u —— 这正是焊接的意义。
+//   * **硬棱靠把盖子那一圈位置和侧壁分开。** 盖子自己复制一圈 rim，不和侧壁共用位置；否则 `BakeMesh`
+//     会把盖子那一面的法线并进侧壁那个位置的平滑平均里，棱就糊了。
+//
+// 圆面（圆柱侧、圆锥侧、球）标 `smooth`，盖子和平面留平。这是**有意背离引擎"一律平面"的老规矩**——
+// 不然 8×16 的球看着是一块块的面。一个 bool，想翻就翻。
+
+namespace detail {
+
+/// 把一个凸的 n 边环从中心扇成 n 个三角形。`Face` 只放得下三或四个角，所以 n > 4 的盖子必须扇。
+/// `rim` 是 n 个位置下标（按绕序），`rim_uv` 同序；`upward` 决定绕序是朝 +Y 还是 -Y（从外面看）。
+inline void FanRim(MeshDescription& out, std::uint32_t centre, const std::vector<std::uint32_t>& rim,
+                   const std::vector<std::array<float, 2>>& rim_uv, std::array<float, 2> centre_uv,
+                   bool upward, std::uint32_t material, bool smooth) {
+    const std::uint32_t n = static_cast<std::uint32_t>(rim.size());
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint32_t j = (i + 1) % n;
+        // 朝上的盖子反过来绕 —— 绕序就是法线的方向。
+        const std::uint32_t first = upward ? j : i;
+        const std::uint32_t second = upward ? i : j;
+
+        Face face;
+        face.count = 3;
+        face.smooth = smooth;
+        face.material = material;
+        face.corners[0] = centre;
+        face.corners[1] = rim[first];
+        face.corners[2] = rim[second];
+        face.uv[0][0] = centre_uv[0];
+        face.uv[0][1] = centre_uv[1];
+        face.uv[1][0] = rim_uv[first][0];
+        face.uv[1][1] = rim_uv[first][1];
+        face.uv[2][0] = rim_uv[second][0];
+        face.uv[2][1] = rim_uv[second][1];
+        out.faces.push_back(face);
+    }
+}
+
+/// 一个位置一条材质一个角的合并写法，省得每个函数把七行 uv 赋值抄一遍。
+inline void PushFace(MeshDescription& out, const std::uint32_t* corners, const float (*uv)[2],
+                     std::uint32_t count, bool smooth) {
+    Face face;
+    face.count = count;
+    face.smooth = smooth;
+    for (std::uint32_t k = 0; k < count; ++k) {
+        face.corners[k] = corners[k];
+        face.uv[k][0] = uv[k][0];
+        face.uv[k][1] = uv[k][1];
+    }
+    out.faces.push_back(face);
+}
+
+}  // namespace detail
+
+/// 单位立方体的描述：八个位置、六个四边面。和建模器起手那个方块是同一份。
+inline MeshDescription DescribeBox() {
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+    out.positions = {
+        {-0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, -0.5f},
+        {-0.5f, 0.5f, -0.5f},  {-0.5f, 0.5f, 0.5f},  {0.5f, 0.5f, 0.5f},  {0.5f, 0.5f, -0.5f},
+    };
+    // 每个面的角按逆时针（从外面看）。
+    const std::uint32_t faces[6][4] = {
+        {0, 3, 2, 1},  // 下，-Y
+        {4, 5, 6, 7},  // 上，+Y
+        {1, 2, 6, 5},  // 前，+Z
+        {0, 4, 7, 3},  // 后，-Z
+        {3, 7, 6, 2},  // 右，+X
+        {0, 1, 5, 4},  // 左，-X
+    };
+    for (const auto& corners : faces) {
+        const float uv[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+        detail::PushFace(out, corners, uv, 4, /*smooth=*/false);
+    }
+    return out;
+}
+
+/// XZ 平面上的一块网格，法线 +Y，半宽 0.5，切成 `divisions` x `divisions` 格。
+inline MeshDescription DescribeGrid(int divisions, float uv_tiles = 1.0f) {
+    const int n = divisions < 1 ? 1 : divisions;
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+    for (int iz = 0; iz <= n; ++iz) {
+        for (int ix = 0; ix <= n; ++ix) {
+            out.positions.push_back({static_cast<float>(ix) / static_cast<float>(n) - 0.5f, 0.0f,
+                                     static_cast<float>(iz) / static_cast<float>(n) - 0.5f});
+        }
+    }
+    const auto at = [n](int ix, int iz) { return static_cast<std::uint32_t>(iz * (n + 1) + ix); };
+    for (int iz = 0; iz < n; ++iz) {
+        for (int ix = 0; ix < n; ++ix) {
+            const std::uint32_t a = at(ix, iz);
+            const std::uint32_t b = at(ix + 1, iz);
+            const std::uint32_t c = at(ix, iz + 1);
+            const std::uint32_t d = at(ix + 1, iz + 1);
+            const float u0 = static_cast<float>(ix) / static_cast<float>(n) * uv_tiles;
+            const float u1 = static_cast<float>(ix + 1) / static_cast<float>(n) * uv_tiles;
+            const float v0 = static_cast<float>(iz) / static_cast<float>(n) * uv_tiles;
+            const float v1 = static_cast<float>(iz + 1) / static_cast<float>(n) * uv_tiles;
+            // [a, c, d, b]：绕出来是 +Y，而且 `BakeMesh` 会沿 a–d 折（和 MakeGrid 同一个对角）。
+            const std::uint32_t corners[4] = {a, c, d, b};
+            const float uv[4][2] = {{u0, v0}, {u0, v1}, {u1, v1}, {u1, v0}};
+            detail::PushFace(out, corners, uv, 4, /*smooth=*/false);
+        }
+    }
+    return out;
+}
+
+/// XZ 平面上的一个圆盘，法线 +Y，半径 0.5。uv 是它的外接正方形（uv = 位置 + 0.5），一张方图铺上去
+/// 正中就在盘心 —— 和 `MakeDisc` 一样，那是棋子脸上的做法。
+inline MeshDescription DescribeDisc(int sides = 32) {
+    const int n = sides < 3 ? 3 : sides;
+    const float radius = 0.5f;
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+
+    out.positions.push_back({0.0f, 0.0f, 0.0f});  // 盘心
+    std::vector<std::uint32_t> rim;
+    std::vector<std::array<float, 2>> rim_uv;
+    for (int i = 0; i < n; ++i) {
+        const float theta = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(n);
+        const float c = std::cos(theta);
+        const float s = std::sin(theta);
+        rim.push_back(static_cast<std::uint32_t>(out.positions.size()));
+        out.positions.push_back({radius * c, 0.0f, radius * s});
+        rim_uv.push_back({radius * c + 0.5f, radius * s + 0.5f});
+    }
+    detail::FanRim(out, 0, rim, rim_uv, {0.5f, 0.5f}, /*upward=*/true, 0, /*smooth=*/false);
+    return out;
+}
+
+/// 单位圆柱：半径 0.5、高 1、轴 +Y、居中。侧壁平滑，两个盖子平。
+inline MeshDescription DescribeCylinder(int sides = 16) {
+    const int n = sides < 3 ? 3 : sides;
+    const float radius = 0.5f;
+    const float half = 0.5f;
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+
+    // 侧壁：两圈各 n 个位置，接缝焊在一起（不是 n+1 个）。
+    std::vector<std::uint32_t> bottom, top;
+    for (int i = 0; i < n; ++i) {
+        const float theta = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(n);
+        const float c = std::cos(theta);
+        const float s = std::sin(theta);
+        bottom.push_back(static_cast<std::uint32_t>(out.positions.size()));
+        out.positions.push_back({radius * c, -half, radius * s});
+        top.push_back(static_cast<std::uint32_t>(out.positions.size()));
+        out.positions.push_back({radius * c, half, radius * s});
+    }
+    for (int i = 0; i < n; ++i) {
+        const int j = (i + 1) % n;
+        const float u0 = static_cast<float>(i) / static_cast<float>(n);
+        const float u1 = static_cast<float>(i + 1) / static_cast<float>(n);  // 收口那次是 1.0
+        const std::uint32_t corners[4] = {bottom[i], top[i], top[j], bottom[j]};
+        const float uv[4][2] = {{u0, 0.0f}, {u0, 1.0f}, {u1, 1.0f}, {u1, 0.0f}};
+        detail::PushFace(out, corners, uv, 4, /*smooth=*/true);
+    }
+
+    // 两个盖子：各自复制一圈 rim，不和侧壁共用位置。
+    for (int cap = 0; cap < 2; ++cap) {
+        const float y = cap == 0 ? -half : half;
+        std::vector<std::uint32_t> rim;
+        std::vector<std::array<float, 2>> rim_uv;
+        for (int i = 0; i < n; ++i) {
+            const float theta = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(n);
+            const float c = std::cos(theta);
+            const float s = std::sin(theta);
+            rim.push_back(static_cast<std::uint32_t>(out.positions.size()));
+            out.positions.push_back({radius * c, y, radius * s});
+            rim_uv.push_back({c * 0.5f + 0.5f, s * 0.5f + 0.5f});
+        }
+        const std::uint32_t centre = static_cast<std::uint32_t>(out.positions.size());
+        out.positions.push_back({0.0f, y, 0.0f});
+        detail::FanRim(out, centre, rim, rim_uv, {0.5f, 0.5f}, /*upward=*/cap == 1, 0,
+                       /*smooth=*/false);
+    }
+    return out;
+}
+
+/// 单位圆锥：底面半径 0.5 在 y = -0.5，尖在 y = +0.5，轴 +Y。侧面平滑，底面平。
+inline MeshDescription DescribeCone(int sides = 16) {
+    const int n = sides < 3 ? 3 : sides;
+    const float radius = 0.5f;
+    const float half = 0.5f;
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+
+    std::vector<std::uint32_t> side_rim;
+    for (int i = 0; i < n; ++i) {
+        const float theta = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(n);
+        side_rim.push_back(static_cast<std::uint32_t>(out.positions.size()));
+        out.positions.push_back({radius * std::cos(theta), -half, radius * std::sin(theta)});
+    }
+    const std::uint32_t apex = static_cast<std::uint32_t>(out.positions.size());
+    out.positions.push_back({0.0f, half, 0.0f});
+
+    for (int i = 0; i < n; ++i) {
+        const int j = (i + 1) % n;
+        const std::uint32_t corners[3] = {apex, side_rim[j], side_rim[i]};
+        const float uv[3][2] = {{0.5f, 1.0f},
+                                {static_cast<float>(i + 1) / static_cast<float>(n), 0.0f},
+                                {static_cast<float>(i) / static_cast<float>(n), 0.0f}};
+        detail::PushFace(out, corners, uv, 3, /*smooth=*/true);
+    }
+
+    // 底面：自己复制一圈 rim。
+    std::vector<std::uint32_t> base_rim;
+    std::vector<std::array<float, 2>> base_uv;
+    for (int i = 0; i < n; ++i) {
+        const float theta = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(n);
+        const float c = std::cos(theta);
+        const float s = std::sin(theta);
+        base_rim.push_back(static_cast<std::uint32_t>(out.positions.size()));
+        out.positions.push_back({radius * c, -half, radius * s});
+        base_uv.push_back({c * 0.5f + 0.5f, s * 0.5f + 0.5f});
+    }
+    const std::uint32_t base_centre = static_cast<std::uint32_t>(out.positions.size());
+    out.positions.push_back({0.0f, -half, 0.0f});
+    detail::FanRim(out, base_centre, base_rim, base_uv, {0.5f, 0.5f}, /*upward=*/false, 0,
+                   /*smooth=*/false);
+    return out;
+}
+
+/// 单位球：半径 0.5、居中、平滑。`rings` 是纬度带数，`segments` 是经度段数。
+///
+/// 两极各**一个**位置（不是一圈），所以平滑平均出来的极点法线正好是 ±Y；接缝焊在第 0 列。两极那一圈
+/// 本来退化成三角形（`MakeSphere` 留着，`BakeMesh` 会拒一个没面积的面），这里只留不退化那一个。
+inline MeshDescription DescribeSphere(int rings = 8, int segments = 16) {
+    const int bands = rings < 2 ? 2 : rings;
+    const int segs = segments < 3 ? 3 : segments;
+    const float radius = 0.5f;
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+
+    const std::uint32_t north = static_cast<std::uint32_t>(out.positions.size());
+    out.positions.push_back({0.0f, radius, 0.0f});
+    for (int i = 1; i < bands; ++i) {
+        const float phi = detail::kPi * static_cast<float>(i) / static_cast<float>(bands);
+        const float y = radius * std::cos(phi);
+        const float rr = radius * std::sin(phi);
+        for (int j = 0; j < segs; ++j) {
+            const float theta = detail::kTwoPi * static_cast<float>(j) / static_cast<float>(segs);
+            out.positions.push_back({rr * std::cos(theta), y, rr * std::sin(theta)});
+        }
+    }
+    const std::uint32_t south = static_cast<std::uint32_t>(out.positions.size());
+    out.positions.push_back({0.0f, -radius, 0.0f});
+
+    // 第 i 圈（i 从 1 起）、第 j 列的位置下标；列 j 对 segs 取模，就是接缝那样合上。
+    const auto ring_at = [&](int i, int j) {
+        return static_cast<std::uint32_t>(north + 1 + (i - 1) * segs + (j % segs));
+    };
+    const auto u_of = [&](int j) { return static_cast<float>(j) / static_cast<float>(segs); };
+    const auto v_of = [&](int i) {
+        return 1.0f - static_cast<float>(i) / static_cast<float>(bands);
+    };
+
+    for (int j = 0; j < segs; ++j) {  // 北极带
+        const std::uint32_t corners[3] = {north, ring_at(1, j + 1), ring_at(1, j)};
+        const float uv[3][2] = {
+            {u_of(j), 1.0f}, {u_of(j + 1), v_of(1)}, {u_of(j), v_of(1)}};
+        detail::PushFace(out, corners, uv, 3, /*smooth=*/true);
+    }
+    for (int i = 1; i < bands - 1; ++i) {  // 中间带
+        for (int j = 0; j < segs; ++j) {
+            const std::uint32_t corners[4] = {ring_at(i, j), ring_at(i, j + 1), ring_at(i + 1, j + 1),
+                                              ring_at(i + 1, j)};
+            const float uv[4][2] = {{u_of(j), v_of(i)},
+                                    {u_of(j + 1), v_of(i)},
+                                    {u_of(j + 1), v_of(i + 1)},
+                                    {u_of(j), v_of(i + 1)}};
+            detail::PushFace(out, corners, uv, 4, /*smooth=*/true);
+        }
+    }
+    for (int j = 0; j < segs; ++j) {  // 南极带
+        const std::uint32_t corners[3] = {ring_at(bands - 1, j), ring_at(bands - 1, j + 1), south};
+        const float uv[3][2] = {
+            {u_of(j), v_of(bands - 1)}, {u_of(j + 1), v_of(bands - 1)}, {u_of(j + 1), 0.0f}};
+        detail::PushFace(out, corners, uv, 3, /*smooth=*/true);
+    }
+    return out;
+}
+
+/// 圆环：主半径 0.5、管半径 0.18，环躺在 XZ 平面上（洞的轴是 +Y）。`major` 是主圈段数，`minor`
+/// 是管子那一圈的段数。两圈都**首尾相接**（没有接缝要复制，两端用取模拟合上）。整圈平滑。
+inline MeshDescription DescribeTorus(int major = 24, int minor = 12) {
+    const int m = major < 3 ? 3 : major;
+    const int s = minor < 3 ? 3 : minor;
+    const float big = 0.5f;
+    const float small = 0.18f;
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+
+    for (int i = 0; i < m; ++i) {
+        const float u = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(m);
+        const float cu = std::cos(u);
+        const float su = std::sin(u);
+        for (int j = 0; j < s; ++j) {
+            const float v = detail::kTwoPi * static_cast<float>(j) / static_cast<float>(s);
+            const float ring = big + small * std::cos(v);
+            out.positions.push_back({ring * cu, small * std::sin(v), ring * su});
+        }
+    }
+    const auto at = [m, s](int i, int j) {
+        return static_cast<std::uint32_t>((i % m) * s + (j % s));
+    };
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < s; ++j) {
+            // [i,j] → [i,j+1] → [i+1,j+1] → [i+1,j]：绕出来法线朝管子外面。
+            const std::uint32_t corners[4] = {at(i, j), at(i, j + 1), at(i + 1, j + 1), at(i + 1, j)};
+            const float u0 = static_cast<float>(i) / static_cast<float>(m);
+            const float u1 = static_cast<float>(i + 1) / static_cast<float>(m);
+            const float v0 = static_cast<float>(j) / static_cast<float>(s);
+            const float v1 = static_cast<float>(j + 1) / static_cast<float>(s);
+            const float uv[4][2] = {{u0, v0}, {u0, v1}, {u1, v1}, {u1, v0}};
+            detail::PushFace(out, corners, uv, 4, /*smooth=*/true);
+        }
+    }
+    return out;
+}
+
+/// 金字塔：边长 1 的方底在 y = -0.5，尖在 y = +0.5。平面着色。
+inline MeshDescription DescribePyramid() {
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+    out.positions = {
+        {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, 0.5f}, {-0.5f, -0.5f, 0.5f},
+        {0.0f, 0.5f, 0.0f},   // 尖
+    };
+    // 底面：法线 -Y。角按 0→1→2→3 绕（这四个角在这个文件里是这么排的，和方块那份不一样）。
+    {
+        const std::uint32_t corners[4] = {0, 1, 2, 3};
+        const float uv[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+        detail::PushFace(out, corners, uv, 4, /*smooth=*/false);
+    }
+    // 四个侧面：绕序让法线朝外（每个面都是一条底边 + 尖）。
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const std::uint32_t corners[3] = {(i + 1) % 4, i, 4};
+        const float uv[3][2] = {{1.0f, 0.0f}, {0.0f, 0.0f}, {0.5f, 1.0f}};
+        detail::PushFace(out, corners, uv, 3, /*smooth=*/false);
+    }
+    return out;
+}
+
+/// 圆台：底半径 0.5 在 y = -0.5，顶半径 0.28 在 y = +0.5，轴 +Y。侧壁平滑，两个盖子平。
+inline MeshDescription DescribeFrustum(int sides = 16) {
+    const int n = sides < 3 ? 3 : sides;
+    const float bottom = 0.5f;
+    const float top = 0.28f;
+    const float half = 0.5f;
+    MeshDescription out;
+    out.materials.push_back(MeshMaterial{{0.62f, 0.64f, 0.68f, 1.0f}, 0.35f});
+
+    std::vector<std::uint32_t> bottom_ring;
+    std::vector<std::uint32_t> top_ring;
+    for (int i = 0; i < n; ++i) {
+        const float theta = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(n);
+        const float c = std::cos(theta);
+        const float s = std::sin(theta);
+        bottom_ring.push_back(static_cast<std::uint32_t>(out.positions.size()));
+        out.positions.push_back({bottom * c, -half, bottom * s});
+        top_ring.push_back(static_cast<std::uint32_t>(out.positions.size()));
+        out.positions.push_back({top * c, half, top * s});
+    }
+    for (int i = 0; i < n; ++i) {
+        const int j = (i + 1) % n;
+        const float u0 = static_cast<float>(i) / static_cast<float>(n);
+        const float u1 = static_cast<float>(i + 1) / static_cast<float>(n);
+        const std::uint32_t corners[4] = {bottom_ring[i], top_ring[i], top_ring[j],
+                                          bottom_ring[j]};
+        const float uv[4][2] = {{u0, 0.0f}, {u0, 1.0f}, {u1, 1.0f}, {u1, 0.0f}};
+        detail::PushFace(out, corners, uv, 4, /*smooth=*/true);
+    }
+    // 两个盖子：各自复制一圈 rim（和侧壁分开，棱才是棱；两圈半径不一样）。
+    for (int cap = 0; cap < 2; ++cap) {
+        const float y = cap == 0 ? -half : half;
+        const float radius = cap == 0 ? bottom : top;
+        std::vector<std::uint32_t> rim;
+        std::vector<std::array<float, 2>> rim_uv;
+        for (int i = 0; i < n; ++i) {
+            const float theta = detail::kTwoPi * static_cast<float>(i) / static_cast<float>(n);
+            const float c = std::cos(theta);
+            const float s = std::sin(theta);
+            rim.push_back(static_cast<std::uint32_t>(out.positions.size()));
+            out.positions.push_back({radius * c, y, radius * s});
+            rim_uv.push_back({c * 0.5f + 0.5f, s * 0.5f + 0.5f});
+        }
+        const std::uint32_t centre = static_cast<std::uint32_t>(out.positions.size());
+        out.positions.push_back({0.0f, y, 0.0f});
+        detail::FanRim(out, centre, rim, rim_uv, {0.5f, 0.5f}, /*upward=*/cap == 1, 0,
+                       /*smooth=*/false);
+    }
+    return out;
+}
+
 namespace detail {
 
 // 取平均是这两个操作里出现最多的动作，摊开来写会淹掉真正在说什么的那几行。

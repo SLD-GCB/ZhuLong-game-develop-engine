@@ -115,6 +115,20 @@ public:
     void SetSP(std::uint64_t value) { jit_.SetSP(value); }
     std::uint64_t GetSP() const { return jit_.GetSP(); }
 
+    /// TPIDR_EL0, the thread pointer.
+    ///
+    /// dynarmic is handed the address of this member when the JIT is built and
+    /// reads through that pointer, so a write here is visible to the next
+    /// instruction -- the same contract as SetPC and SetSP, and the same
+    /// requirement that the core be stopped.
+    void SetTpidrEl0(std::uint64_t value) { tpidr_el0_ = value; }
+    std::uint64_t GetTpidrEl0() const { return tpidr_el0_; }
+
+    /// TPIDRRO_EL0, the read-only-from-EL0 thread pointer. Same contract as
+    /// SetTpidrEl0: dynarmic reads through the address of this member.
+    void SetTpidrroEl0(std::uint64_t value) { tpidrro_el0_ = value; }
+    std::uint64_t GetTpidrroEl0() const { return tpidrro_el0_; }
+
     /// Read x0..x30. Anything else reads as zero (which is what x31/XZR reads as).
     std::uint64_t ReadGpr(std::size_t index) {
         return index < 31 ? jit_.GetRegister(index) : 0;

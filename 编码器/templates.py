@@ -7,6 +7,9 @@ vocabulary and the scene template shows all of them.
 
 Both faces of the machine are here. The Python one goes through the module; the C++ one goes
 through the libraries, which is why it is compiled before it is run.
+
+最后一份是例外：**「曲子」是一份数据，不是程序** —— 它是 `.song` 的骨架，写好了在「音频」那一页用
+「导入音乐…」放进来听。见 `文档/12-音频工作台.md`。
 """
 
 from __future__ import annotations
@@ -241,4 +244,31 @@ int main() {
                 machine.faults());
     return 0;
 }
+''')
+
+SONG = ("曲子", '''# 一首曲子：一段循环。第一行是版本，一行一条指令，`#` 起注释。
+#
+#   tempo  速度（BPM）
+#   loop   一遍多少拍 —— 渲染出来的长度就是它
+#   instrument <编号> wave … attack … decay … sustain … release … gain … cutoff … seed …
+#          一件乐器 = 波形 + 包络（ADSR）+ 一个低通。包络按**每个音符自己的长度**铺满。
+#   note <起点拍> <长度拍> <音高 MIDI> <力度 0..1> <乐器编号>
+#          音高：60 = 中央 C，69 = A4 = 440 Hz。乐器要写在音符前面。
+#
+# 在「音频」那一页按「导入音乐…」把它放进世界（默认循环、默认全局 —— 背景音乐不跟位置走）。
+# 改一个数，重新导入一次就听到了。
+song 1
+tempo 120
+loop 4
+
+# 一件三角波走一段小旋律，一件噪声打点。
+instrument 0 wave triangle attack 0.01 decay 0.12 sustain 0.6 release 0.2 gain 0.5 cutoff 0
+instrument 1 wave noise attack 0.001 decay 0.05 sustain 0 release 0.02 gain 0.6 cutoff 5000 seed 7
+
+note 0 1 60 0.9 0
+note 1 1 64 0.85 0
+note 2 1 67 0.9 0
+note 3 1 72 0.8 0
+note 0 1 36 1.0 1
+note 2 1 36 0.9 1
 ''')

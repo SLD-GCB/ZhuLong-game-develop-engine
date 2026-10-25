@@ -74,12 +74,22 @@ class Viewport(QWidget):
         self._image: QImage | None = None
         self._frames = 0
         self._capturing = False
+        self._fill = False
         self.setMinimumSize(240, 160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAutoFillBackground(False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # Windows only sends move events while a button is held unless the widget asks for the rest.
         self.setMouseTracking(True)
+
+    def set_fill(self, on: bool) -> None:
+        """铺满（拉伸）还是按比例留边。
+
+        建模器那一块要**铺满**：它的图是按面板形状出的，窗口一改形状，图就该跟着铺满而不是按比例缩
+        小、留两条黑边（看起来像画布变小了）。游戏那块按比例留边才正确 —— 那是程序自己定的分辨率。
+        """
+        self._fill = on
+        self.update()
 
     @property
     def frames(self) -> int:
@@ -138,6 +148,9 @@ class Viewport(QWidget):
         room = self.room()
         if room.isEmpty():
             return None
+        if self._fill:
+            # 铺满：不按比例、不留边。`frame_at` 也走这里，所以鼠标换算和画的是同一块。
+            return room
         scaled = self._image.size().scaled(room.size(), Qt.AspectRatioMode.KeepAspectRatio)
         left = room.x() + (room.width() - scaled.width()) // 2
         top = room.y() + (room.height() - scaled.height()) // 2

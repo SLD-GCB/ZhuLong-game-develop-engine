@@ -12,6 +12,7 @@
     烛龙.exe                    **所有** Python 代码，冻成一个
     依赖库/                      上面那个 exe 的依赖：PySide6、python313.dll、Qt 插件……
     建模器/建模器.exe             编辑器里「3D 建模」那一页起的那个工具
+    音频器/音频器.exe             编辑器里「音频」那一页起的那个工具
     运行环境/
         ziglib/zlong.dll         **所有** C++ 代码，收成一个二进制
         python/                  跑用户脚本的解释器（标准库只发字节码）
@@ -76,6 +77,12 @@ ZIG_BUILD = "build-zig"                # 打包时用它自己编出来的构建
 MODELER_TARGET = "zlong_modeler"
 MODELER = "建模器"
 MODELER_DIR = "建模器"
+
+# 音频器：CMake 目标叫 `zlong_audiotool`（**不是 `zlong_audio`** —— 那个名字已经是内核那层音频库
+# 了），装进包之后叫「音频器.exe」，放在「音频器/」下。
+AUDIO_TARGET = "zlong_audiotool"
+AUDIO = "音频器"
+AUDIO_DIR = "音频器"
 
 # 软件图标。**源图只有项目根目录那一张 `烛龙.jpg`**，`.ico` 是打包时从它生出来的。
 #
@@ -152,8 +159,8 @@ NOT_SHIPPED = ("xiangqi", "gugong")
 # exe 里的模块是 PyInstaller 顺着 `import` 自己收的，列在这儿**不是**为了让它们进去，而是为了
 # **查**：新加一个模块却没人 import、被某个 `--exclude-module` 误伤、或者它明明在磁盘上却没进
 # 归档 —— 这三种都不会自己吭声，只会等用户按了某个按钮才发现。所以装完之后**真的去读一遍归档**。
-EDITOR_MODULES = ("console", "cpp", "editor", "findbar", "frames", "highlighter", "main",
-                  "packager", "runtime", "templates", "viewport", "window")
+EDITOR_MODULES = ("console", "cpp", "editor", "findbar", "frames", "highlighter", "instruments",
+                  "main", "packager", "runtime", "templates", "timeline", "viewport", "window")
 # 第二张表是编辑器模块自己 import 的**标准库** —— 照着 `编码器/*.py` 的 `import` 数出来的。
 # `sys` 和 `time` 不在表里：它们是内建模块（编在 `python313.dll` 里），归档里永远找不到，列进来
 # 只会每次都报一句假警。
@@ -1244,6 +1251,18 @@ def build_cxx(package: Path, report: list[str]) -> tuple[Path, dict] | None:
                       f" —— 编辑器的「3D 建模」那一页起的就是这一个")
     else:
         report.append(f"    缺：{MODELER_DIR}/{MODELER}{EXE_SUFFIX} —— C++ 那一步没编出来")
+
+    # **音频器也跟着包走。** 同上：编辑器里「音频」那一页起的就是它，包里没有源码去编它 —— 所以
+    # 发的也是成品。
+    audio = build / "宿主" / (AUDIO_TARGET + EXE_SUFFIX)
+    if audio.is_file():
+        (package / AUDIO_DIR).mkdir(parents=True, exist_ok=True)
+        target = package / AUDIO_DIR / (AUDIO + EXE_SUFFIX)
+        shutil.copy2(audio, target)
+        report.append(f"  {AUDIO_DIR}/{AUDIO}{EXE_SUFFIX}  {size_of(target)}"
+                      f" —— 编辑器的「音频」那一页起的就是这一个")
+    else:
+        report.append(f"    缺：{AUDIO_DIR}/{AUDIO}{EXE_SUFFIX} —— C++ 那一步没编出来")
     return zig, environment
 
 

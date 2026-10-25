@@ -45,12 +45,30 @@ bool RightAxis(const Camera& camera, Vec3& right) {
     return std::sqrt(Dot(right, right)) > 1.0e-6f;
 }
 
+/// 一个 voice 放的是"哪一段"的指纹：声音号、采样率、帧数、循环开关。两次 Prepare 在同一个位置上
+/// 指纹一样，就说明那一段没换，游标可以留着（见 `Prepare`）。
+///
+/// 用指纹而不是 `clip` 指针：重新 Load 一次之后，上一批 voice 里的指针已经指到别人身上了，读不得。
+/// 四个数一起看，是因为单看声音号不够 —— 改了频率、长了、换了一段等长的声音，号都可能撞上。
+std::uint64_t VoiceSignature(std::int32_t sound, const audio::Clip& clip, bool loop) {
+    std::uint64_t value = 1469598103934665603ull;   // FNV-1a 起点
+    const auto mix = [&value](std::uint64_t word) {
+        value ^= word;
+        value *= 1099511628211ull;
+    };
+    mix(static_cast<std::uint64_t>(sound));
+    mix(clip.rate);
+    mix(static_cast<std::uint64_t>(clip.frames.size()));
+    mix(loop ? 1ull : 0ull);
+    return value == 0 ? 1ull : value;               // 0 留给"没有声音"
+}
+
 }  // namespace
 
 bool SoundRenderer::Prepare(const Scene& scene, std::string& error) {
-    voices_.clear();
-    voices_.reserve(scene.emitters.size());
-    emitter_count_ = scene.emitters.size();
+    // **先把整份场景验完，再动旧的 voice。** 半路失败就保持原样，不上不下的一份更糟。
+    std::vector<std::uint64_t> next_signatures;
+    next_signatures.reserve(scene.emitters.size());
 
     for (std::size_t index = 0; index < scene.emitters.size(); ++index) {
         const Emitter& emitter = scene.emitters[index];
@@ -69,7 +87,7 @@ bool SoundRenderer::Prepare(const Scene& scene, std::string& error) {
             return false;
         }
 
-        audio::Voice voice;
+        std::uint64_t signature = 0;
         if (emitter.sound != kNoSound) {
             if (emitter.sound < 0 ||
                 static_cast<std::size_t>(emitter.sound) >= scene.sounds.size()) {
@@ -81,14 +99,38 @@ bool SoundRenderer::Prepare(const Scene& scene, std::string& error) {
                 error = "a scene sound has no frames, or no rate to play them at";
                 return false;
             }
+            signature = VoiceSignature(emitter.sound, clip, emitter.loop);
+        }
+        next_signatures.push_back(signature);
+    }
+
+    // 拼下一批 voice。**放着同一样东西的，游标留着** —— 位置、音量、距离变了不该让声音从头来；
+    // 换了一段、或者增删让序号挪了，那一个从头。
+    std::vector<audio::Voice> next;
+    next.reserve(scene.emitters.size());
+    for (std::size_t index = 0; index < scene.emitters.size(); ++index) {
+        const Emitter& emitter = scene.emitters[index];
+        audio::Voice voice;
+        if (emitter.sound != kNoSound) {
+            const audio::Clip& clip = scene.sounds[emitter.sound];
             // A pointer into the scene's own clip: the scene outlives the voice, and a
             // copy per emitter would be a copy of the whole sound.
             voice.clip = &clip;
             voice.step = audio::StepFor(clip);
             voice.loop = emitter.loop;
+            // 上一次在同一个位置上放的就是这一段吗？是就接着放。
+            if (next_signatures[index] != 0 && index < voices_.size() &&
+                index < signatures_.size() && signatures_[index] == next_signatures[index]) {
+                voice.cursor = voices_[index].cursor;
+                voice.finished = voices_[index].finished;
+            }
         }
-        voices_.push_back(voice);
+        next.push_back(voice);
     }
+
+    voices_ = std::move(next);
+    signatures_ = std::move(next_signatures);
+    emitter_count_ = scene.emitters.size();
 
     error.clear();
     return true;
@@ -121,19 +163,26 @@ bool SoundRenderer::Mix(const Scene& scene, std::span<audio::Frame> frames, std:
         // Where this emitter is now. Its parent is a node, so the node walk above and
         // the emitter's own local are the whole path.
         const Emitter& emitter = scene.emitters[index];
-        const Mat4 transform =
-            emitter.parent == kNoParent ? emitter.local : world[emitter.parent] * emitter.local;
-        const Vec3 position{transform.m[0][3], transform.m[1][3], transform.m[2][3]};
 
-        const Vec3 to_emitter = position - scene.camera.eye;
-        const float distance = std::sqrt(Dot(to_emitter, to_emitter));
-        const audio::Sample level =
-            static_cast<audio::Sample>(emitter.gain * DistanceGain(emitter, distance) *
-                                       scene.master_gain);
-
+        // **Non-spatial emitters skip the two laws below entirely.** Background music is not
+        // somewhere in the world: it is full gain and dead centre wherever the listener is. That
+        // is the only difference, and it is why a song is played from one.
         std::array<audio::Sample, audio::kChannels> pan{centre, centre};
-        if (panned && distance > 1.0e-6f) {
-            pan = PanGains(Normalize(to_emitter), right);
+        audio::Sample level = 0.0f;
+        if (!emitter.spatial) {
+            level = static_cast<audio::Sample>(emitter.gain * scene.master_gain);
+        } else {
+            const Mat4 transform =
+                emitter.parent == kNoParent ? emitter.local : world[emitter.parent] * emitter.local;
+            const Vec3 position{transform.m[0][3], transform.m[1][3], transform.m[2][3]};
+
+            const Vec3 to_emitter = position - scene.camera.eye;
+            const float distance = std::sqrt(Dot(to_emitter, to_emitter));
+            level = static_cast<audio::Sample>(emitter.gain * DistanceGain(emitter, distance) *
+                                               scene.master_gain);
+            if (panned && distance > 1.0e-6f) {
+                pan = PanGains(Normalize(to_emitter), right);
+            }
         }
         for (std::uint32_t channel = 0; channel < audio::kChannels; ++channel) {
             voice.gain[channel] = level * pan[channel];
